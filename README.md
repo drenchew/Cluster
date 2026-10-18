@@ -264,6 +264,153 @@ host/samples/rpm_3500.wav
 They get resampled and crossfaded by rpm. Force the choice with
 `--audio samples` or `--audio synth`.
 
+## Game telemetry: ETS2 / ATS
+
+`host/run_ets2.py` drives the same jig from Euro Truck Simulator 2 (or American
+Truck Simulator) with no game-side hardware and no new wire protocol: it reads
+the game's shared memory and pushes the usual 50 Hz setpoints at `link.py`.
+
+### Getting the data out of the game
+
+The game does not publish telemetry itself — the community **SCS SDK plugin**
+does. Install it, then:
+
+- **Linux (native build):** drop the plugin `.so` into
+  `<ETS2>/bin/linux_x64/plugins/` (create `plugins/` if it is not there),
+  start the game and accept the SDK consent dialog. It writes the whole
+  `scsTelemetryMap_t` struct into a 32 KiB POSIX shared-memory object and
+  refreshes it every frame.
+
+  **The object's name is not standardised across plugin forks.** Upstream and
+  the truckermudgeon fork use `/dev/shm/SCSTelemetry`; others use different
+  names, and ETS2LA's controller plugin uses a `/dev/shm/SCS/` subdirectory.
+  So `run_ets2.py` tries the known names and then scans `/dev/shm` for
+  anything of the right size. If it still misses yours:
+
+  ```
+  python3 run_ets2.py --probe                  # what is actually in /dev/shm
+  python3 run_ets2.py --shm-name MyBlockName   # or an absolute path
+  ```
+- **Windows (native build):** same install under `bin\win_x64\plugins\`, and
+  the block is a named mapping **`Local\SCSTelemetry`**. `run_ets2.py` works
+  there too.
+- **Proton / Wine:** not supported. The Windows build's mapping lives inside
+  the Wine prefix where no native Linux process can see it, and the Linux
+  build is a different install. A bridge process running *inside* the prefix
+  would be needed; this repo does not ship one.
+
+### From Steam (the usual case)
+
+ETS2 ships a native Linux build on Steam, so this works — but two Steam
+specifics will silently produce "no telemetry" with no other symptom. Run
+the doctor first; it finds the install, says exactly where the plugin goes,
+and names anything that would stop it working:
+
+```
+python3 run_ets2.py --setup
+```
+
+It walks every Steam library (including extra drives via
+`steamapps/libraryfolders.vdf`) and checks:
+
+1. **Is `bin/linux_x64` actually populated?** If Steam has forced Proton, that
+   directory is empty or missing and only `bin/win_x64` exists. Telemetry
+   cannot work. Fix: right-click the game → Properties → Compatibility →
+   **untick** "Force the use of a specific Steam Play compatibility tool", and
+   let Steam re-download the Linux binaries. (A known Steam client bug can
+   also swap the Linux binaries for Windows ones on its own, with the same
+   fix.)
+2. **Is Steam a Flatpak?** Flatpak gives each sandbox its own `/dev/shm`, so
+   the game's telemetry block is invisible outside it. Fix:
+   `flatpak override --user --device=shm com.valvesoftware.Steam`, then fully
+   restart Steam.
+
+The plugin goes in `<game>/bin/linux_x64/plugins/` — create `plugins/` if it
+is not there. Typical Steam locations:
+
+```
+~/.local/share/Steam/steamapps/common/Euro Truck Simulator 2/bin/linux_x64/plugins/
+~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/...   (Flatpak)
+```
+- **macOS:** not supported — the reader expects POSIX shared memory in
+  `/dev/shm`, which macOS does not have.
+
+### Running it
+
+**Only `pyserial` is needed** — this path uses no pygame, numpy or
+sounddevice, so on the Linux box `pip install pyserial` is the whole install.
+
+```
+cd host
+python3 run_ets2.py --setup                 # find Steam/ETS2, check it can work
+python3 run_ets2.py --selftest              # layout check: no game, no jig
+python3 run_ets2.py --probe                 # what telemetry blocks exist
+python3 run_ets2.py --source mock --no-serial   # scripted drive, nothing attached
+python3 run_ets2.py --source mock           # scripted drive -> real cluster
+python3 run_ets2.py                         # the game -> real cluster
+python3 run_ets2.py --port /dev/ttyUSB0
+python3 run_ets2.py --list                  # serial ports
+```
+
+`python3` on Linux (the port will be `/dev/ttyUSB0` for a CH340 or
+`/dev/ttyACM0` for a genuine Uno); `py -3` on Windows.
+
+Useful flags: `--rpm-scale` (spread a ~2500 rpm truck engine over the car
+dial), `--tank-l` (car-tank size the fuel gauge reads as full scale),
+`--speed-scale`, `--lights-on` (force side + low beam), `--shm-name`,
+`--no-serial`, `-v` (one status line per second instead of on change only),
+`--rate` (frames per second to the jig).
+
+On Linux you will likely need to be in the `dialout` group to open the port:
+`sudo usermod -aG dialout $USER`, then log out and back in.
+
+The status line is the whole diagnostic surface:
+
+```
+18:49:14  90 km/h  1500 rpm D6  park off  fuel 36.4 l  84 C  lights 0x05  [100 frames, link ok]
+18:49:19  no telemetry (no mapping Local\SCSTelemetry (is the game running?)) - cluster runs its own demo sweep  [link not opened yet]
+```
+
+`link ok` / `link <error>` comes straight from `ClusterLink`, so a flaky cable
+shows up there rather than as a frozen cluster. The serial port is only opened
+on the first frame we actually send, hence `not opened yet` while the game is
+not producing telemetry.
+
+### What the truck becomes
+
+| game channel | cluster |
+|---|---|
+| `truck.speed` (m/s) | speedometer × 3.6 |
+| `truck.engineRpm` | tachometer × `--rpm-scale` |
+| `truck.fuel / config.fuelCapacity` | fuel gauge as a **fill fraction** × `--tank-l` |
+| `truck.waterTemperature` | coolant gauge, 0x1D0 |
+| `truck.gear` (<0 R, 0 N, >0 D) | gear position + number |
+| `truck.parkBrake` | handbrake telltale, 0x34F + 0x1B4 |
+| `truck.blinkerLeft/RightActive` | turn signals, 0x1F6 |
+| `truck.lightsParking / BeamLow / BeamHigh` | light telltales, 0x21A |
+| `truck.electricEnabled / engineEnabled` | KL15 + engine-on state |
+| `truck.gameThrottle` | pedal readout in the telemetry rail |
+
+Three of those are deliberate compromises:
+
+- **Fuel is a fraction, not litres.** The truck carries 400–800 l; sent raw it
+  would pin a car gauge. The firmware also clamps to 800 deci-litres.
+- **The tachometer idles at 800.** A truck idles near 600 rpm, but the
+  firmware floors rpm at `cfg::ENGINE_IDLE_RPM` (800) while the engine is on
+  (`ClusterCan.cpp`), so below idle the needle simply sits at 800.
+- **Blinker *enable*, not lamp.** `truck.lblinker` is the logical switch and
+  `truck.light.lblinker` is the 2 Hz lamp state. Feeding the lamp would
+  re-kick the cluster's own 0x1F6 flasher every frame.
+
+### When the game goes quiet
+
+`ShmSource.poll()` returns `None` when the mapping is gone, the SDK is not
+active, or `frame.time` has not advanced for 0.75 s (paused game, main menu,
+alt-tabbed replay). Nothing is sent, the firmware's 1.5 s host watchdog trips,
+and the cluster drops into its own demo sweep — it never resets and never
+holds a stale value. Same story on Ctrl-C: `run_ets2.py` closes the link and
+the jig carries on by itself.
+
 ## Frames
 
 Confidence column: **OK** means corroborated by a working bench capture and/or
@@ -365,6 +512,8 @@ src/Demo.{h,cpp}          local sweep when no host is connected
 src/main.cpp              wiring, text console
 E90_Cluster/              standalone ESP32 sketch (same fixes applied)
 host/run.py               simulator entry point
+host/run_ets2.py              ETS2 / ATS shared-memory entry point
+host/cluster_sim/ets2.py      scsTelemetryMap_t reader + game -> cluster mapping
 host/cluster_sim/link.py      serial framing, must match src/Protocol.h
 host/cluster_sim/vehicle.py   engine, turbo, gearbox, driveline, chassis
 host/cluster_sim/audio.py     engine synthesis + sample back end
@@ -388,3 +537,5 @@ Byte layouts came from these, cross-checked against each other:
 - [loopybunny — K-CAN](http://www.loopybunny.co.uk/CarPC/k_can.html) — frame rates and IDs from a real bus
 - [veikkos/e90-can-cluster](https://github.com/veikkos/e90-can-cluster) — a working driver for this exact cluster: 0x1A6 accumulator at 13.0 counts/s per km/h, 100 ms cadence, +400 time tick, time-based 0x1A0 alive nibble. Its `e90_m3_dump_veikkos.txt` is the capture analysed above
 - [E65 ReverseEngineering — 0x1A0](https://github.com/HeinrichG-V12/E65_ReverseEngineering/blob/main/docs/0x1A0.md) — 0x1A0 bit fields and checksum
+- [truckermudgeon/scs-sdk-plugin](https://github.com/truckermudgeon/scs-sdk-plugin) — the plugin that publishes `scsTelemetryMap_t`; its `scs-telemetry/inc/scs-telemetry-common.hpp` is the layout `host/cluster_sim/ets2.py` mirrors
+- [SCS Software — Telemetry SDK](https://modding.scssoft.com/wiki/SCS_SDK) — channel units and semantics (`gear`, blinker enable vs. lamp)

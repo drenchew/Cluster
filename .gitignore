@@ -6,3 +6,8 @@
 .vscode/launch.json
 .vscode/ipch
 compile_commands.json
+
+# Python
+__pycache__/
+*.py[cod]
+host/samples/
