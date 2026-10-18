@@ -1,0 +1,7 @@
+# pygame-ce is the maintained fork and is the one with wheels for current
+# Python (3.13/3.14). It imports as "pygame", so the code is unchanged.
+# If you are on an older Python and prefer upstream, plain "pygame" also works.
+pygame-ce>=2.5.0
+pyserial>=3.5
+numpy>=1.24
+sounddevice>=0.4.6
