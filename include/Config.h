@@ -59,6 +59,7 @@ constexpr bool SEND_COOLANT          = true;   // [OK] 0x1D0 (DBC-confirmed B0)
 constexpr bool SEND_LIGHTS           = true;   // [OK] 0x21A illumination/backlight
 constexpr bool SEND_TURN             = true;   // [OK] 0x1F6 turn signals
 constexpr bool SEND_BRAKE            = true;   // [OK] 0x1B4 handbrake + speed
+constexpr bool SEND_PARK_BRAKE       = true;   // [OK] 0x34F handbrake status (2 byte)
 constexpr bool SEND_DIMMER           = false;  // [?]  0x202 dimmer level
 constexpr bool SEND_LCD_LIGHT        = false;  // [?]  0x2C0 LCD illumination
 constexpr bool SEND_GEAR             = false;  // [?]  0x1D2 gear display P/R/N/D
@@ -92,8 +93,8 @@ constexpr uint16_t ENGINE_IDLE_RPM = 800;   // diesel KOMBI idles ~800
 constexpr bool     ENGINE_RUNNING_AT_BOOT = true;
 
 // ---- Scaling ---------------------------------------------------------------
-// 0x1B4 / 0x0CE speed word: km/h per count (community DBC value). 0x1A6 and
-// 0x1A0 carry their own scalings in their sections below.
+// 0x1B4 speed word: km/h per count (community DBC value). 0x1A6 and 0x1A0 and
+// 0x0CE carry their own scalings in their sections below.
 constexpr float SPEED_KMH_PER_COUNT = 0.103f;
 constexpr uint16_t RPM_LIMIT   = 7000;
 constexpr uint16_t SPEED_LIMIT = 400;
@@ -174,18 +175,32 @@ constexpr uint8_t LIGHT_FOGR  = 0x40;   // rear fog                 [?]
 // if that is what it wants, 0x1A0 so it can read a direct speed value.
 // 0x1A6 alone was never enough on this jig.
 //
-// 0x1A0's layout, alive nibble and checksum are verified against the capture;
-// 0x0CE wheel speeds remain [?] - scaling and filler bytes are guesses.
+// 0x1A0's layout, alive nibble and checksum are verified against the capture.
+//
+// 0x0CE layout is now decoded from the same capture (see SPEED_0CE_PER_COUNT):
+// four signed 16-bit little-endian wheel speeds, and real DSC sends it every
+// 100 ms whether or not anything else is on the bus. It is on by default so
+// the DSC side of the cluster has the wheel speeds it expects - a DSC that
+// reports no wheel speed at all is the classic way to end up with the ABS,
+// DSC and tyre-pressure telltales lit.
 constexpr uint8_t SPEED_SRC_1A0 = 0x01;   // 0x1A0 "Speed K-CAN", 12-bit, 0.1 km/h
-constexpr uint8_t SPEED_SRC_0CE = 0x02;   // 0x0CE four 16-bit wheel speeds [?]
-constexpr uint8_t SPEED_SOURCES = SPEED_SRC_1A0;   // default: 0x1A6 + 0x1A0
+constexpr uint8_t SPEED_SRC_0CE = 0x02;   // 0x0CE four 16-bit wheel speeds
+constexpr uint8_t SPEED_SOURCES = SPEED_SRC_1A0 | SPEED_SRC_0CE;   // 0x1A6 + 0x1A0 + 0x0CE
 
 // 0x1A0 scaling: 0.1 km/h per count (E65 document). Verified against the
 // capture - V_VEH peaks at 159 while the 0x1A6 rate integrates to ~15 km/h.
 // 50 km/h is 500 = 0x1F4 -> B0=0xF4, B1=0x01.
 constexpr float SPEED_1A0_PER_COUNT = 0.1f;
-// 0x0CE scaling is unverified. 0.0625 (1/16) is the other common BMW figure.
-constexpr float SPEED_0CE_PER_COUNT = 0.1f;
+// 0x0CE: four 16-bit LE wheel speeds, SIGNED. Measured against 0x1A0's V_VEH
+// over the 1154-frame capture the word reads 1.573 +/- 0.01 counts per km/h at
+// every speed from 40 to 150 km/h (bucket means 1.567 .. 1.597), i.e. about
+// 0.636 km/h per count. That is wheel pulses per 100 ms frame at 48 pulses per
+// revolution on a 225/45R17 (2.10 m circumference -> 0.636 counts per km/h),
+// which is what a real DSC counts. The sign flips when the car drives
+// backwards: the 91 negative frames in the capture fall exactly inside the
+// 0x1D2 = R gear window (t 668094..682657), |word| still tracks V_VEH.
+// Send magnitude only - this jig never simulates reverse speed.
+constexpr float SPEED_0CE_PER_COUNT = 0.636f;
 
 // ---- 0x1A6 / scheduler cadence ---------------------------------------------
 // Real cadences measured off the capture: 0x1A6 = 100.0 ms, 0x1A0 = 99.7 ms,

@@ -62,7 +62,7 @@ class Setpoints:
     range_km: int = 500
     kl15: bool = True
     engine: bool = True
-    handbrake: bool = True
+    handbrake: bool = False
     reverse: bool = False
     lights: int = LIGHT_SIDE | LIGHT_LOW
     turn_left: bool = False

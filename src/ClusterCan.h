@@ -97,6 +97,7 @@ private:
   void send1D2();   // 0x1D2 gear display
   void send3B0();   // 0x3B0 reverse gear
   void send366();   // 0x366 outside temp + range
+  void send34F();   // 0x34F handbrake status (2 bytes, event + 5 s)
 
   MCP2515 mcp_{cfg::PIN_CS, cfg::SPI_HZ};
 
@@ -114,7 +115,10 @@ private:
   volatile uint8_t  gearPos_   = GEAR_P;
   volatile uint8_t  gearNum_   = 0;     // 1..6, 0 = blank
   volatile uint8_t  gearMode_  = MODE_NORMAL;
-  volatile bool     handbrake_ = true;
+  // Released at boot. The cluster lights the park-brake telltale and gongs for
+  // as long as this is set, and both the host GUI and the firmware used to
+  // power up with it engaged - so the bench booted into "handbrake applied".
+  volatile bool     handbrake_ = false;
   volatile bool     reverse_   = false;
   volatile bool     engineOn_  = cfg::ENGINE_RUNNING_AT_BOOT;
   volatile bool     kl15_      = true;
@@ -126,7 +130,8 @@ private:
   uint32_t lastTick_ = 0;
   uint32_t tick_     = 0;
   uint8_t  cnt130_ = 0, cnt0AA_ = 0, cnt1D0_ = 0, cnt0C0_ = 0xF0, cnt0D7_ = 0;
-  uint8_t  cnt1B4_ = 0, cnt1D2_ = 0;
+  uint8_t  cnt1B4_ = 0, cnt1D2_ = 0, cnt19E_ = 0;
+  bool     hb34F_  = false;       // last 0x34F handbrake state put on the bus
   uint8_t  lastTurn_ = 0;       // to emit the 0x1F6 "new blink" byte once
   uint16_t dist1A6_   = 0;      // 0x1A6 B0..B5 cumulative distance accumulator
   float    distAccum_ = 0.0f;   // sub-count remainder, so low speeds still add up

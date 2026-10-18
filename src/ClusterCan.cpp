@@ -141,6 +141,13 @@ void ClusterCan::update() {
       break;
     default: break;
   }
+  // 0x34F is event driven in a real car: on a state change, plus a keepalive
+  // roughly every 5 s. The capture shows exactly that pattern (FD/FE bursts on
+  // the gear change, then one frame per 5 s while the state holds).
+  if (cfg::SEND_PARK_BRAKE && (handbrake_ != hb34F_ || (tick_ % 500) == 6)) {
+    hb34F_ = handbrake_;
+    send34F();
+  }
   if (cfg::SEND_RANGE && (tick_ % 100) == 6) send366();  // 1 s
   drainRx();
 }
@@ -298,9 +305,10 @@ void ClusterCan::send1A0() {
   send(0x1A0, d, 8);
 }
 
-/* 0x0CE  DSC wheel speeds, 8 bytes, 100 ms [?] - alternative speed source
+/* 0x0CE  DSC wheel speeds, 8 bytes, 100 ms  -> alternative speed source
  * Four 16-bit little-endian wheel speeds (FL, FR, RL, RR), all sent equal.
- * Scaling is unverified; see cfg::SPEED_0CE_PER_COUNT. Enable with 'x 2'. */
+ * Scaling and sign are capture-verified - see cfg::SPEED_0CE_PER_COUNT.
+ * On by default now (cfg::SPEED_SOURCES). */
 void ClusterCan::send0CE() {
   uint16_t raw = (uint16_t)((float)speedKmh_ / cfg::SPEED_0CE_PER_COUNT);
   uint8_t lo = raw & 0xFF, hi = raw >> 8;
@@ -338,17 +346,55 @@ void ClusterCan::send1B4() {
   send(0x1B4, d, 8);
 }
 
-/* 0x1D0  Engine data: B0 = coolant + 48 degC, B2 counter, B6 0xCC clutch released
- * B0 scaling is DBC-confirmed: EngineCoolantTemp = raw*1 - 48 degC. */
+/* 0x1D0  Engine data, 8 bytes, 100 ms
+ *   B0 = coolant + 48 degC (DBC confirmed: EngineCoolantTemp = raw - 48)
+ *   B1 = oil + 48 degC, same offset (veikkos driver + capture both)
+ *   B2 = (alive & 0x0F) | engine_run_state << 4, state 0 off / 1 starting /
+ *        2 running / 3 invalid
+ *   B6/B7 static filler
+ *
+ * B2 used to be a raw byte counter, cnt1D0_++, so after 16 frames its upper
+ * nibble - the engine state - started rolling through off / starting /
+ * invalid for a quarter of every 256 frames while the cluster was being told
+ * KL15 on and engine running. A cluster told that keeps gonging and lighting
+ * the charge / oil / brake telltales (see cfg::ENGINE_IDLE_RPM), so the state
+ * nibble has to be pinned and only the low nibble counted. */
 void ClusterCan::send1D0() {
-  uint8_t d[8] = {(uint8_t)(coolantC_ + 48), 0xFF, cnt1D0_++, 0xFF, 0xFF, 0xFF, 0xCC, 0xFF};
+  int16_t oil = coolantC_ - 20;                  // capture runs ~20 C below coolant
+  if (oil < -48) oil = -48;
+  uint8_t state = engineOn_ ? 0x20 : 0x00;       // 0x02 << 4 = running
+  uint8_t d[8] = {(uint8_t)(coolantC_ + 48), (uint8_t)(oil + 48),
+                  (uint8_t)((cnt1D0_ = (cnt1D0_ + 1) & 0x0F) | state),
+                  0xFF, 0xFF, 0xFF, 0xCC, 0xFF};
   send(0x1D0, d, 8);
 }
 
-/* 0x19E DSC status (static capture) */
+/* 0x19E DSC status, 8 bytes, 200 ms
+ *   B2 high nibble rotates (counter % 3), low nibble 0x03
+ *   B3 0xFC   B4 0xCC   B5 0x00   B6 0x00
+ *   B7 rolling counter
+ *
+ * This used to be a frozen payload {00 E0 B3 FC F0 43 00 65}: no counter
+ * anywhere, so a DSC that never once changes its status frame reads as a dead
+ * sender - and B5=0x43 appears in none of the 1154 real frames (real values
+ * are 0x00, 0x41, 0x61, 0x40). The bytes here are the veikkos/e90-can-cluster
+ * driver's, which is the one open-source payload proven to keep an E9x KOMBI
+ * happy. The raw capture uses B2 low nibble 0x0F / B4 0xFE instead, so both
+ * variants evidently pass - what neither does is stop counting. */
 void ClusterCan::send19E() {
-  const uint8_t d[8] = {0x00, 0xE0, 0xB3, 0xFC, 0xF0, 0x43, 0x00, 0x65};
+  uint8_t d[8] = {0x00, 0xE0, (uint8_t)(((cnt19E_ % 3) << 4) | 0x03),
+                  0xFC, 0xCC, 0x00, 0x00, cnt19E_++};
   send(0x19E, d, 8);
+}
+
+/* 0x34F  Handbrake status, 2 bytes [OK]  -> PARK-BRAKE telltale + gong
+ *   B0 0xFD released, 0xFE engaged      B1 0xFF
+ * DLC 2 confirmed on the capture (22 frames: 20 x "FD FF" released while
+ * driving, 2 x "FE FF" parked), and 0x1B4 B5/B6 says the same thing with a
+ * different signal. Sent on change plus a 5 s keepalive - see update(). */
+void ClusterCan::send34F() {
+  uint8_t d[2] = {(uint8_t)(handbrake_ ? 0xFE : 0xFD), 0xFF};
+  send(0x34F, d, 2);
 }
 
 /* 0x0C0 ABS counter: B0 cycles 0xF0..0xFF, B1 0xFF */

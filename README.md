@@ -59,7 +59,7 @@ l 5      lights mask        b 200   dimmer 0..255       g 8    gear 1P 2R 4N 8D
 n 1      turn: 0 off, 1 left, 2 right, 3 hazard
 h 0|1    handbrake          e 0|1   engine running      k 0|1  terminal 15
 o 0|1|2  0x1A6 distance accumulator: frozen / alive / distance
-x 0..3   extra speed frames: +1 = 0x1A0, +2 = 0x0CE
+x 0..3   extra speed frames: +1 = 0x1A0, +2 = 0x0CE (both on by default)
 d        resume demo sweep  ?       print state
 ```
 
@@ -72,14 +72,15 @@ differentiates to get speed. The jig used to write a constant speed word into
 them, the cluster differentiated a constant, got 0, and parked the needle —
 while every other gauge, fed by direct-value frames, worked normally.
 
-Two frames carry speed, and both are sent by default:
+Three frames carry speed, and all three are sent by default:
 
 | frame | field | rate | note |
 |---|---|---|---|
 | 0x1A0 | 12-bit V_VEH, 0.1 km/h/count | 100 ms | direct value, checksummed |
 | 0x1A6 | 16-bit distance accumulator ×3 | 100 ms | cluster differentiates it |
+| 0x0CE | 4 × signed 16-bit wheel speed, 0.636 km/h/count | 100 ms | DSC wheel speeds |
 
-Both come from the DSC in a real car, and a real capture has them side by
+All three come from the DSC in a real car, and a real capture has them side by
 side. Nothing below needs a reflash:
 
 ```
@@ -87,9 +88,10 @@ s 60        hold 60 km/h, then watch the needle after each step below
 o 2         accumulator tracks distance      (the default, and what a car does)
 o 1         accumulator +1 per frame         (alive-counter test, needle reads 0)
 o 0         accumulator frozen               (proves whether the needle reads it)
-x 0         drop 0x1A0, leaving 0x1A6 alone
-x 1         0x1A6 + 0x1A0                    (the default)
-x 2         0x1A6 + 0x0CE wheel speeds       (unverified layout, last resort)
+x 0         drop 0x1A0 and 0x0CE, leaving 0x1A6 alone
+x 3         0x1A6 + 0x1A0 + 0x0CE              (the default)
+x 1         0x1A6 + 0x1A0 only
+x 2         0x1A6 + 0x0CE wheel speeds only
 ```
 
 ## PC simulator
@@ -132,8 +134,10 @@ nothing in the code changes.
 | `Tab` | show / hide help |
 | `Esc` | quit |
 
-To get moving from cold: `I` (ignition), hold `Enter` until it catches,
-`Space` to release the handbrake, then `W`.
+To get moving from cold: hold `Enter` until the engine catches (ignition is
+already on), `G` for `D`, then `W`. The handbrake starts **released** and the
+lever starts in `P`, so a freshly started bench shows no park-brake telltale
+and the car sits still — `Space` pulls it again if you want the gong.
 
 ### Vehicle model
 
@@ -183,6 +187,7 @@ group defaults to *off* in `include/Config.h`. Enable those one at a time.
 | 0x0AA | 20 ms | engine rpm (B4..B5 = rpm × 4) + pedal | OK |
 | 0x1A6 | 100 ms | cumulative distance accumulator ×3 + time counter | OK |
 | 0x1B4 | 100 ms | speed + handbrake (B5: 0x30 off, 0x32 on; B1 `0xC0`, B2 `0xE2`) | OK |
+| 0x34F | event + 5 s | handbrake status, DLC 2: `FD FF` released / `FE FF` on | OK |
 | 0x21A | 100 ms | illumination / backlight + light telltales | OK |
 | 0x1F6 | 200 ms | turn signals | OK |
 | 0x26E | 200 ms | ignition status | OK |
@@ -190,13 +195,13 @@ group defaults to *off* in `include/Config.h`. Enable those one at a time.
 | 0x349 | 200 ms | fuel level, DLC 5, 160 counts/litre | OK |
 | 0x19E / 0x0C0 / 0x0D7 | 200 ms | DSC / ABS / airbag counters | OK |
 | 0x1A0 | 100 ms | "Speed K-CAN" — direct speed, **on by default** | OK |
-| 0x0CE | 100 ms | DSC wheel speeds — alternative speedo source, `x 2` | ? |
+| 0x0CE | 100 ms | DSC wheel speeds — four signed 16-bit LE, **on by default** | OK |
 | 0x1D2 | 200 ms | gear display P R N D, D1..D6 | ? |
 | 0x202 / 0x2C0 | 200 ms | dimmer level / LCD illumination | ? |
 | 0x3B0 | 200 ms | reverse gear | ? |
 | 0x366 | 1 s | outside temperature + range | ? |
 
-### Three things that will bite you if you change them
+### Four things that will bite you if you change them
 
 **0x130 byte 4 must stay constant.** Its high nibble is a sequence number and
 its low nibble a check value derived from it, so incrementing one alone yields
@@ -222,6 +227,21 @@ picks what gets integrated:
 | `ODO_DISTANCE` (default) | `km/h × 13.0 counts/s` | correct | **accrues real mileage, not reversible** |
 
 Switch live with `o 0`/`o 1`/`o 2` — no reflash — to see the difference.
+
+**0x1D0 byte 2 is a live-alive nibble plus an engine state, not a counter.**
+Bits 0–3 count 0…15 and bits 4–5 are the engine state: 0 off, 1 starting,
+2 running, 3 invalid. Sending a raw `cnt1D0_++` rolls the state nibble through
+*off* and *invalid* for a quarter of every 256 frames while the cluster is also
+being told "terminal 15 on, engine running", which is the stall response above:
+gong plus charge / oil / brake / DSC telltales. The state nibble is pinned to
+`0x20` while `engineOn_` and only the low nibble counts.
+
+**Never send a DSC frame with its counter frozen.** 0x19E (DSC status) was a
+constant payload with no changing byte anywhere in it; a sender whose status
+never once changes reads as dead, and the ABS / DSC / tyre-pressure telltales
+stay lit. Its byte 7 now counts, and the payload matches the working veikkos
+one — the old `B5 = 0x43` never occurs in 1154 real frames (real values:
+`0x00 0x41 0x61 0x40`).
 
 ### Why 13.0 counts/s per km/h, and the +400 time tick
 

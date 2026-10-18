@@ -89,12 +89,13 @@ def torque_at(rpm: float) -> float:
 class Controls:
     throttle: float = 0.0       # 0..1
     brake: float = 0.0          # 0..1
-    handbrake: bool = True
+    handbrake: bool = False
     ignition: bool = True       # terminal 15
     starter: bool = False       # held while cranking
-    # Shift lever: 0 P, 1 R, 2 N, 3 D. Defaults to D so the thing drives as
-    # soon as you release the handbrake and touch the throttle.
-    selector: int = SEL_D
+    # Shift lever: 0 P, 1 R, 2 N, 3 D. Defaults to P with the handbrake
+    # released so a freshly started bench shows the park-brake telltale dark
+    # and the car sits still; press G for D (or Space to pull the handbrake).
+    selector: int = SEL_P
     gear: int = 1               # commanded gear in manual mode, 1..6
     auto: bool = True
     sport: bool = False
