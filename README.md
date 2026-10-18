@@ -98,17 +98,36 @@ x 2         0x1A6 + 0x0CE wheel speeds only
 
 ```
 cd host
-pip install -r requirements.txt
-python run.py                 # auto-detects the Arduino port
-python run.py --port COM6
-python run.py --list          # list serial ports
-python run.py --no-serial     # sim + GUI + audio, no hardware
-python run.py --audio off
+py -3 -m pip install -r requirements.txt
+py -3 run.py                  # auto-detects the Arduino port
+py -3 run.py --port COM6
+py -3 run.py --list           # list serial ports
+py -3 run.py --no-serial      # sim + GUI + audio, no hardware
+py -3 run.py --audio off
 ```
+
+Use `py -3`, not `python`: on a stock Windows install `python` is the Microsoft
+Store alias, which drops into an interactive prompt instead of running your
+script.
 
 `pygame-ce` is in requirements rather than `pygame` because it is the fork
 that ships wheels for current Python (3.13/3.14). It imports as `pygame`, so
 nothing in the code changes.
+
+**Why pygame and not a GUI toolkit:** a cluster needs 60 fps hand-drawn dials
+and per-frame held-key state, which is what immediate-mode SDL2 is for. Qt or
+Dear PyGui would mean fighting a widget framework to custom-draw every gauge
+anyway, and a web UI adds a server and keyboard-focus problems for no gain.
+The work that makes it look like an instrument panel is in `gauges.py`: dial
+faces are rendered once and cached so only the needle is redrawn, needles are
+rotated with `rotozoom` (which filters as it rotates) instead of being drawn
+as rotated polygons, and lit elements get an additive downscale-blur glow.
+That costs about 6 ms a frame, leaving plenty of the 16.7 ms budget.
+
+Needles run through a second-order spring (`NeedleMotion`) rather than chasing
+their target, so they lag and overshoot ~3% like a real stepper. It integrates
+in fixed 1/240 s substeps — a single 1/60 s explicit-Euler step on a spring
+that stiff is already marginal, and one dropped frame makes it diverge.
 
 ### Controls
 
@@ -128,10 +147,12 @@ nothing in the code changes.
 | `1`–`6` | select a gear directly |
 | `L` | lights: off → side → low → high |
 | `F` / `V` | front / rear fog |
-| `[` / `]` | dimmer down / up |
+| `[` / `]` | dimmer down / up (visibly dims the panel, as the real one does) |
 | `-` / `=` | fuel down / up |
+| `,` / `.` | road gradient down / up |
+| `T` | reset trip |
 | `P` | sport shift map |
-| `Tab` | show / hide help |
+| `Tab` | controls overlay |
 | `Esc` | quit |
 
 To get moving from cold: hold `Enter` until the engine catches (ignition is
@@ -141,10 +162,56 @@ and the car sits still — `Space` pulls it again if you want the gong.
 
 ### Vehicle model
 
-Tuned to the 2.0 diesel the cluster came behind: 800 rpm idle, torque plateau
-from 1750–2750, 4600 rpm fuel cut, 6-speed with a torque-converter launch.
-The converter matters — without a slipping phase, selecting a gear at a
-standstill locks the engine to stationary wheels and stalls it instantly.
+A turbocharged 6-speed making **332 hp at 5440 rpm and 500 Nm from 2000–4000**,
+idling at 800 with the fuel cut at **5500**. `peak_power_hp()` reports the
+figures straight off `TORQUE_CURVE`, so retuning the curve and re-running the
+tests tells you what you actually built. What gives it the character:
+
+**Turbo lag.** Only `NA_TORQUE_FRAC` (36%) of peak torque is available off
+boost. Stab the throttle at 1200 rpm and that is all you get; the rest arrives
+over the next half second as the turbo spools, and below `BOOST_THRESHOLD_RPM`
+it never arrives at all. Boost is an *air limit* on fuelling, not a multiplier
+on it — part throttle is not air-limited and behaves normally, while full
+throttle off boost is. Multiplying throttle by boost instead double-counts:
+30% throttle at 30% boost came out as 17% of the curve, which left the car
+barely able to accelerate and the gearbox stuck in first.
+
+**Overrun fuel cut.** Lift off above idle and injection stops outright, so the
+engine becomes a brake. The audio reads the fuelling signal directly, which is
+why the note hollows out the instant you lift (measured at 0.47× the on-power
+level at the same rpm).
+
+**Torque interrupt and rev matching.** An upshift cuts fuel and lets the engine
+fall to the next gear's speed; a downshift blips it up to meet the road. Both
+are a slew toward a computed target over the shift time, so the tacho needle
+dips or flares instead of jumping. Plus kickdown above 82% throttle, a shift
+lockout that kills hunting, and shift points that rise with throttle.
+
+**Torque-converter launch.** Without a slipping phase, selecting a gear at a
+standstill locks the engine to stationary wheels and stalls it instantly. The
+converter passes torque in proportion to slip squared, which is also what lets
+it creep at idle.
+
+**Pops and bangs.** Back off a committed throttle and unburnt mixture carries
+into a hot exhaust and ignites there — one bang on the lift, then crackle that
+fades over about half a second. It needs all three of fuelling cut, revs above
+`POP_MIN_RPM`, and the engine having been on boost a moment earlier, so it
+only happens when you actually lift off something, not every time you breathe
+off the pedal at 1500 rpm.
+
+**Traction limit.** Drive force is capped at what the rear axle can take
+(`TYRE_MU × mass × g × REAR_WEIGHT_FRAC` ≈ 8 kN) and the surplus spins the
+engine instead of the car. First gear at the torque peak asks for 14.5 kN, so
+with 500 Nm this now bites on a launch — it did not at the original 340 Nm.
+
+**Road gradient** (`,` / `.`) up to ±20%, which is the quickest way to load the
+engine without needing road speed.
+
+**Fuel burn is deliberately exaggerated.** `FUEL_BURN_SCALE` (25×) drains the
+tank fast enough that the gauge visibly moves on a bench. At the true rate a
+minute of driving burns 0.07 l — 0.1% of the gauge — so the needle looks
+frozen and the gauge appears broken. The scale applies only to the tank level;
+the l/100km readout uses the real rate and stays honest.
 
 ### Engine audio
 
@@ -154,8 +221,30 @@ revolution and the firing frequency is `rpm/30` Hz — 27 Hz at idle, 150 Hz at
 4500. Engine noise is a train of exhaust pressure pulses coloured by the
 resonance of the exhaust tract rather than a sustained harmonic tone, so that
 is what `audio.py` builds: an impulse per firing event through a resonator,
-plus injector clatter and load-dependent turbo whine. Phase is continuous
-across buffers, so pitch glides instead of stepping.
+plus injector clatter. Phase is continuous across buffers, so pitch glides
+instead of stepping, and the output is stereo.
+
+Everything above the base note is driven by the simulation rather than guessed
+from rpm, which is what makes it track what the engine is actually doing:
+
+| layer | driven by |
+|---|---|
+| combustion level | fuelling — so it hollows out on the overrun |
+| turbo whine | boost, at ~19× crank speed — it lags the pedal like the turbo |
+| wastegate flutter | a lift while on boost |
+| starter motor | cranking, before the engine catches |
+| shift thunk | each gearchange |
+| transmission whine | road speed |
+| tyre scrabble | the traction limit being exceeded |
+| pops and bangs | the overrun crackle level, as individual cracks |
+
+The crackle is added to the *excitation* rather than the output, so the
+exhaust resonator colours it like everything else — the pops come out of the
+exhaust rather than out of nowhere. Each crack is a few milliseconds of noise
+with a hard decay, scattered by a Poisson draw so they never fall into a
+rhythm.
+
+`drive_from_vehicle()` in `audio.py` is the single call that feeds all of it.
 
 **On real samples:** I looked, and there is no realistic multi-rpm engine
 sample set available under a license that allows redistribution. The one CC0
@@ -277,9 +366,10 @@ src/main.cpp              wiring, text console
 E90_Cluster/              standalone ESP32 sketch (same fixes applied)
 host/run.py               simulator entry point
 host/cluster_sim/link.py      serial framing, must match src/Protocol.h
-host/cluster_sim/vehicle.py   engine, gearbox, chassis
+host/cluster_sim/vehicle.py   engine, turbo, gearbox, driveline, chassis
 host/cluster_sim/audio.py     engine synthesis + sample back end
-host/cluster_sim/gui.py       dashboard + keyboard
+host/cluster_sim/gauges.py    dials, needles, glow, telltale icons
+host/cluster_sim/gui.py       cluster layout, telemetry rail, keyboard
 ```
 
 The wire format is `0xAA 0x55 <len=20> <20 bytes> <xor>`, little-endian. The

@@ -77,7 +77,10 @@ def main(argv: list[str] | None = None) -> int:
             dt = dash.tick()
             dash.handle_events()
             vehicle.step(dt)
-            engine.update(vehicle.rpm, vehicle.load, vehicle.running)
+            # Pushes rpm/boost/fuelling plus the one-shot shift, wastegate and
+            # start events, so the audio hears what the engine is doing rather
+            # than inferring it from the pedal.
+            au.drive_from_vehicle(engine, vehicle)
 
             now = time.monotonic()
             if link is not None and now >= next_send:

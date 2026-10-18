@@ -1,8 +1,14 @@
-"""Pygame dashboard and keyboard control.
+"""The cluster window: an E9x-style instrument panel plus a telemetry rail.
 
-Draws what the cluster is being told, so you can see whether a disagreement is
-the simulator's fault or the cluster's. Needles are tweened towards their
-targets rather than snapped, which also matches how the real gauges move.
+Layout mirrors the real thing - tacho left, speedo right, fuel and coolant as
+small dials between them, an LCD strip underneath for gear, odometer, trip and
+outside temperature, and telltale rows top and bottom. The right-hand rail is
+the part a real car does not have: live boost, throttle and brake, the link
+state and whatever the firmware is printing, so a disagreement between the sim
+and the cluster is visible at a glance.
+
+Needles run through ``NeedleMotion`` rather than chasing their target directly,
+so they lag and overshoot the way a stepper-driven needle does.
 """
 
 from __future__ import annotations
@@ -11,46 +17,43 @@ import math
 
 import pygame
 
+from . import gauges as g
 from . import link as lk
-from .vehicle import LIMITER_RPM, SEL_D, SEL_N, SEL_P, SEL_R, Vehicle
+from .vehicle import (GEAR_RATIOS, LIMITER_RPM, REDLINE_RPM, SEL_D, SEL_N,
+                      SEL_P, SEL_R, Vehicle)
 
-WIDTH, HEIGHT = 1060, 660
+WIDTH, HEIGHT = 1280, 720
 FPS = 60
 
-BG = (16, 18, 22)
-PANEL = (26, 29, 35)
-EDGE = (52, 57, 66)
-TEXT = (226, 230, 238)
-DIM = (128, 136, 150)
-ACCENT = (240, 120, 60)
-GOOD = (90, 200, 130)
-WARN = (240, 190, 70)
-BAD = (230, 90, 90)
-NEEDLE = (236, 240, 248)
-
-TACH_MAX = 5000
-SPEED_MAX = 260
+# Ranges are multiples of their major interval so the numerals come out round.
+TACH_MAX = 6000      # major 1000 -> 0 1 2 3 4 5 6, limiter at 5.5
+SPEED_MAX = 240      # major 40   -> 0 40 80 120 160 200 240
+FUEL_MAX = 60        # major 30   -> 0 30 60
+# Coolant spans 50..130 like the real gauge, so a normal 90 C sits dead centre
+# instead of three-quarters up an alarming-looking 0..120 scale.
+TEMP_MIN, TEMP_MAX = 50, 130
 
 HELP = [
     ("W / Up", "throttle"),
     ("S / Down", "brake"),
-    ("Space", "handbrake"),
-    ("I", "terminal 15 (ignition)"),
     ("Enter", "hold to crank the starter"),
-    ("K", "kill engine"),
-    ("A / Left", "left indicator"),
-    ("D / Right", "right indicator"),
-    ("Z", "hazards"),
-    ("G", "shift lever: P / R / N / D"),
+    ("I", "terminal 15 (ignition)"),
+    ("K", "kill the engine"),
+    ("Space", "handbrake"),
+    ("G", "shift lever  P / R / N / D"),
     ("M", "auto / manual gearbox"),
     ("E / Q", "shift up / down (manual)"),
     ("1-6", "select a gear directly"),
-    ("L", "lights: off / side / low / high"),
-    ("F", "front fog"),
-    ("V", "rear fog"),
+    ("P", "sport shift map"),
+    ("A / Left", "left indicator"),
+    ("D / Right", "right indicator"),
+    ("Z", "hazards"),
+    ("L", "lights  off / side / low / high"),
+    ("F / V", "front / rear fog"),
     ("[ / ]", "dimmer down / up"),
     ("- / =", "fuel down / up"),
-    ("P", "sport shift map"),
+    (", / .", "gradient down / up"),
+    ("T", "reset trip"),
     ("Tab", "show / hide this help"),
     ("Esc", "quit"),
 ]
@@ -62,24 +65,52 @@ class Dashboard:
         pygame.display.set_caption("E90 cluster bench - simulator")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("consolas,menlo,monospace", 17)
-        self.small = pygame.font.SysFont("consolas,menlo,monospace", 14)
-        self.big = pygame.font.SysFont("consolas,menlo,monospace", 30, bold=True)
+
+        mono = "consolas,dejavusansmono,menlo,monospace"
+        self.fonts = {
+            "numeral": pygame.font.SysFont(mono, 17, bold=True),
+            "label": pygame.font.SysFont(mono, 13),
+            "readout": pygame.font.SysFont(mono, 20, bold=True),
+            "small": pygame.font.SysFont(mono, 13),
+            "lcd": pygame.font.SysFont(mono, 19, bold=True),
+            "lcd_big": pygame.font.SysFont(mono, 34, bold=True),
+            "gear": pygame.font.SysFont(mono, 44, bold=True),
+        }
 
         self.vehicle = vehicle
         self.engine = engine
         self.link = link
         self.port_label = port_label
 
-        self.show_help = True
+        self.show_help = False
         self.running = True
         self.log: list[str] = []
         self._log_tail = ""
 
-        # Tweened needle positions.
-        self._n_rpm = 0.0
-        self._n_speed = 0.0
-        # Indicator blink.
+        # Radii and centres chosen so the small dials clear the big ones: the
+        # tacho ends at 393 and the fuel dial starts at 402.
+        self.tach = g.Dial(radius=158, vmax=TACH_MAX, major=1000,
+                           minor_per_major=4, label="1/min x1000",
+                           value_scale=0.001, redline=LIMITER_RPM,
+                           fonts=self.fonts)
+        self.speedo = g.Dial(radius=158, vmax=SPEED_MAX, major=40,
+                             minor_per_major=4, label="km/h",
+                             fonts=self.fonts)
+        self.fuel = g.Dial(radius=64, vmax=FUEL_MAX, major=30,
+                           minor_per_major=3, label="fuel", fonts=self.fonts,
+                           start_deg=150.0, sweep_deg=120.0,
+                           numerals=False, end_labels=("E", "F"))
+        self.temp = g.Dial(radius=64, vmin=TEMP_MIN, vmax=TEMP_MAX, major=40,
+                           minor_per_major=2, label="temp", fonts=self.fonts,
+                           redline=118, start_deg=270.0, sweep_deg=120.0,
+                           numerals=False, end_labels=("C", "H"))
+
+        self.n_rpm = g.NeedleMotion(freq=3.6, damping=0.70)
+        self.n_speed = g.NeedleMotion(freq=2.4, damping=0.85)
+        self.n_fuel = g.NeedleMotion(freq=0.5, damping=1.0)
+        self.n_temp = g.NeedleMotion(freq=0.5, damping=1.0)
+
+        self.bank = g.TelltaleBank()
         self._blink_t = 0.0
         self._blink_on = False
 
@@ -137,6 +168,8 @@ class Dashboard:
             c.fog_rear = not c.fog_rear
         elif key == pygame.K_p:
             c.sport = not c.sport
+        elif key == pygame.K_t:
+            v.reset_trip()
         elif key == pygame.K_LEFTBRACKET:
             c.dimmer = max(0, c.dimmer - 25)
         elif key == pygame.K_RIGHTBRACKET:
@@ -145,6 +178,10 @@ class Dashboard:
             v.fuel_l = max(0.0, v.fuel_l - 5.0)
         elif key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
             v.fuel_l = min(60.0, v.fuel_l + 5.0)
+        elif key == pygame.K_COMMA:
+            c.grade_pct = max(-20.0, c.grade_pct - 2.0)
+        elif key == pygame.K_PERIOD:
+            c.grade_pct = min(20.0, c.grade_pct + 2.0)
         elif pygame.K_1 <= key <= pygame.K_6:
             c.auto = False
             c.selector = SEL_D
@@ -206,180 +243,207 @@ class Dashboard:
     # -- drawing ------------------------------------------------------------
     def draw(self, dt: float) -> None:
         v = self.vehicle
-        c = v.controls
 
         self._blink_t += dt
         if self._blink_t >= 0.34:
             self._blink_t = 0.0
             self._blink_on = not self._blink_on
 
-        k = min(1.0, dt * 9.0)
-        self._n_rpm += (v.rpm - self._n_rpm) * k
-        self._n_speed += (abs(v.speed_kmh) - self._n_speed) * k
+        rpm = self.n_rpm.step(v.rpm, dt)
+        speed = self.n_speed.step(abs(v.speed_kmh), dt)
+        fuel = self.n_fuel.step(v.fuel_l, dt)
+        temp = self.n_temp.step(v.coolant_c, dt)
 
         s = self.screen
-        s.fill(BG)
+        s.fill(g.BG)
 
-        self._gauge(s, (238, 236), 150, self._n_rpm, TACH_MAX, 1000, "rpm x1000", 0.001,
-                    redline=LIMITER_RPM)
-        self._gauge(s, (556, 236), 150, self._n_speed, SPEED_MAX, 20, "km/h", 1.0)
+        # Dim the whole panel with the cluster dimmer, as the real backlight
+        # would - it is a control the user has, so it should visibly do this.
+        panel = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
-        self._draw_gear(s, 397, 372)
-        self._draw_bars(s, 740, 60)
-        self._draw_telltales(s, 740, 250)
-        self._draw_status(s, 740, 372)
-        self._draw_log(s, 24, 470)
+        self.tach.draw(panel, (232, 292), max(0.0, rpm), f"{v.rpm:4.0f}")
+        self.speedo.draw(panel, (708, 292), max(0.0, speed), f"{abs(v.speed_kmh):3.0f}")
+        self.fuel.draw(panel, (470, 206), max(0.0, fuel))
+        self.temp.draw(panel, (470, 378), max(0.0, temp))
+
+        self._draw_lcd(panel, 350, 460)
+        self._draw_telltales(panel)
+        self._draw_telltales_lower(panel, 120, 600)
+
+        dim = max(0.35, v.controls.dimmer / 255.0)
+        if dim < 0.999:
+            panel.fill((int(255 * dim),) * 3 + (255,),
+                       special_flags=pygame.BLEND_RGBA_MULT)
+        s.blit(panel, (0, 0))
+
+        self._draw_rail(s, 940, 36)
         if self.show_help:
             self._draw_help(s)
+        else:
+            hint = self.fonts["small"].render("Tab  controls", True, g.LABEL)
+            s.blit(hint, (20, HEIGHT - 26))
 
         pygame.display.flip()
 
-    def _gauge(self, s, centre, radius, value, vmax, step, label, scale, redline=None):
-        cx, cy = centre
-        start, sweep = math.radians(144.0), math.radians(252.0)
-        pygame.draw.circle(s, PANEL, centre, radius)
-        pygame.draw.circle(s, EDGE, centre, radius, 2)
-
-        if redline is not None:
-            a0 = start + sweep * (redline / vmax)
-            pts = [centre]
-            steps = 24
-            for i in range(steps + 1):
-                a = a0 + (start + sweep - a0) * i / steps
-                pts.append((cx + math.cos(a) * radius, cy + math.sin(a) * radius))
-            pygame.draw.polygon(s, (70, 30, 30), pts)
-
-        ticks = int(vmax / step)
-        for i in range(ticks + 1):
-            a = start + sweep * (i / ticks)
-            inner = radius - (16 if i % 2 == 0 else 9)
-            p0 = (cx + math.cos(a) * inner, cy + math.sin(a) * inner)
-            p1 = (cx + math.cos(a) * (radius - 3), cy + math.sin(a) * (radius - 3))
-            pygame.draw.line(s, TEXT if i % 2 == 0 else DIM, p0, p1, 2)
-            if i % 2 == 0:
-                txt = self.small.render(f"{i * step * scale:g}", True, DIM)
-                tp = (cx + math.cos(a) * (radius - 32), cy + math.sin(a) * (radius - 32))
-                s.blit(txt, txt.get_rect(center=tp))
-
-        frac = max(0.0, min(1.0, value / vmax))
-        a = start + sweep * frac
-        tip = (cx + math.cos(a) * (radius - 20), cy + math.sin(a) * (radius - 20))
-        tail = (cx - math.cos(a) * 18, cy - math.sin(a) * 18)
-        pygame.draw.line(s, ACCENT, tail, tip, 4)
-        pygame.draw.circle(s, NEEDLE, centre, 9)
-        pygame.draw.circle(s, EDGE, centre, 9, 2)
-
-        lab = self.small.render(label, True, DIM)
-        s.blit(lab, lab.get_rect(center=(cx, cy + 52)))
-        val = self.big.render(f"{value:.0f}", True, TEXT)
-        s.blit(val, val.get_rect(center=(cx, cy + 86)))
-
-    def _draw_gear(self, s, x, y):
+    # -- LCD strip ----------------------------------------------------------
+    def _draw_lcd(self, s, x, y):
         v = self.vehicle
         c = v.controls
+        box = pygame.Rect(x, y, 240, 118)
+        pygame.draw.rect(s, g.LCD_BG, box, border_radius=6)
+        pygame.draw.rect(s, (40, 60, 50), box, 1, border_radius=6)
+
         if c.selector != SEL_D:
-            text = v.selector_name
+            gear_txt = v.selector_name
+        elif v.shifting:
+            gear_txt = "--"
         elif v.gear <= 0:
-            text = "D-"
+            gear_txt = "D"
         else:
             prefix = "M" if not c.auto else ("S" if c.sport else "D")
-            text = f"{prefix}{v.gear}"
-        box = pygame.Rect(x, y, 90, 62)
-        pygame.draw.rect(s, PANEL, box, border_radius=8)
-        pygame.draw.rect(s, EDGE, box, 2, border_radius=8)
-        g = self.big.render(text, True, ACCENT if v.gear != 0 else DIM)
-        s.blit(g, g.get_rect(center=box.center))
+            gear_txt = f"{prefix}{v.gear}"
+        img = self.fonts["gear"].render(gear_txt, True, g.LCD_FG)
+        s.blit(img, img.get_rect(center=(box.x + 46, box.y + 36)))
 
-    def _draw_bars(self, s, x, y):
-        v = self.vehicle
+        f = self.fonts["lcd"]
         rows = [
-            ("fuel", v.fuel_l, 60.0, "l", GOOD if v.fuel_l > 8 else BAD),
-            ("coolant", v.coolant_c, 130.0, "C", GOOD if v.coolant_c < 110 else BAD),
-            ("range", v.range_km, 1000.0, "km", DIM),
-            ("throttle", v.controls.throttle * 100, 100.0, "%", ACCENT),
-            ("brake", v.controls.brake * 100, 100.0, "%", BAD),
-            ("dimmer", v.controls.dimmer, 255.0, "", WARN),
+            (f"{v.odo_m / 1000.0:8.1f} km", box.y + 62),
+            (f"trip {v.trip_m / 1000.0:5.1f} km", box.y + 84),
         ]
-        for i, (name, val, vmax, unit, colour) in enumerate(rows):
-            ry = y + i * 30
-            s.blit(self.small.render(name, True, DIM), (x, ry))
-            bar = pygame.Rect(x + 78, ry + 2, 150, 12)
-            pygame.draw.rect(s, PANEL, bar, border_radius=3)
-            frac = max(0.0, min(1.0, val / vmax))
-            if frac > 0:
-                fill = pygame.Rect(bar.x, bar.y, int(bar.w * frac), bar.h)
-                pygame.draw.rect(s, colour, fill, border_radius=3)
-            pygame.draw.rect(s, EDGE, bar, 1, border_radius=3)
-            s.blit(self.small.render(f"{val:.0f}{unit}", True, TEXT), (x + 238, ry))
+        for txt, ry in rows:
+            s.blit(f.render(txt, True, g.LCD_FG), (box.x + 12, ry))
 
-    def _draw_telltales(self, s, x, y):
+        s.blit(f.render(f"{v.outside_c:4.0f} C", True, g.LCD_FG),
+               (box.x + 148, box.y + 14))
+        cons = f"{v.l_per_100km:4.1f}" if v.l_per_100km > 0.1 else " --.-"
+        s.blit(f.render(f"{cons} l", True, g.LCD_FG), (box.x + 148, box.y + 36))
+
+    # -- telltales ----------------------------------------------------------
+    def _draw_telltales(self, s):
         v = self.vehicle
         c = v.controls
         left = (c.turn_left or c.hazard) and self._blink_on
         right = (c.turn_right or c.hazard) and self._blink_on
-        lamps = [
-            ("<", left, GOOD),
-            (">", right, GOOD),
-            ("P!", c.handbrake, BAD),
-            ("BATT", c.ignition and not v.running, BAD),
-            ("OIL", c.ignition and not v.running, BAD),
-            ("side", c.lights_step >= 1, WARN),
-            ("low", c.lights_step >= 2, GOOD),
-            ("HIGH", c.lights_step >= 3, (110, 160, 240)),
-            ("fogF", c.fog_front, GOOD),
-            ("fogR", c.fog_rear, WARN),
-        ]
-        s.blit(self.small.render("telltales", True, DIM), (x, y - 20))
-        for i, (name, on, colour) in enumerate(lamps):
-            bx = x + (i % 5) * 56
-            by = y + (i // 5) * 34
-            box = pygame.Rect(bx, by, 50, 28)
-            pygame.draw.rect(s, colour if on else PANEL, box, border_radius=5)
-            pygame.draw.rect(s, EDGE, box, 1, border_radius=5)
-            col = (20, 20, 24) if on else DIM
-            t = self.small.render(name, True, col)
-            s.blit(t, t.get_rect(center=box.center))
+        # Top row sits in the gap above the two big dials, indicators pushed
+        # out to the sides as they are on the real cluster.
+        y = 56
+        self.bank.draw(s, "turn_l", (352, y), left, g.GOOD)
+        self.bank.draw(s, "turn_r", (562, y), right, g.GOOD)
+        self.bank.draw(s, "high", (412, y), c.lights_step >= 3, g.BLUE)
+        self.bank.draw(s, "low", (452, y), c.lights_step >= 2, g.GOOD)
+        self.bank.draw(s, "glow", (492, y),
+                       c.ignition and not v.running and v.coolant_c < 40, g.AMBER)
 
-    def _draw_status(self, s, x, y):
+    def _draw_telltales_lower(self, s, x, y):
         v = self.vehicle
         c = v.controls
+        key_on_engine_off = c.ignition and not v.running
+        lamps = [
+            ("park", c.handbrake, g.BAD),
+            ("batt", key_on_engine_off, g.BAD),
+            ("oil", key_on_engine_off, g.BAD),
+            ("abs", not v.running, g.AMBER),
+            ("dsc", v.wheelspin > 0.05 or not v.running, g.AMBER),
+            ("belt", True, g.BAD),
+            ("fog_f", c.fog_front, g.GOOD),
+            ("fog_r", c.fog_rear, g.AMBER),
+        ]
+        for i, (name, on, colour) in enumerate(lamps):
+            self.bank.draw(s, name, (x + i * 76, y), bool(on), colour)
+
+    # -- telemetry rail -----------------------------------------------------
+    def _draw_rail(self, s, x, y):
+        v = self.vehicle
+        c = v.controls
+        f = self.fonts["small"]
+        rail = pygame.Rect(x - 14, y - 14, WIDTH - x, 520)
+        pygame.draw.rect(s, (15, 16, 20), rail, border_radius=8)
+        pygame.draw.rect(s, (44, 48, 57), rail, 1, border_radius=8)
+
+        s.blit(self.fonts["readout"].render("telemetry", True, g.LABEL), (x, y))
+        ry = y + 34
+        bars = [
+            ("throttle", c.throttle * 100, 100.0, g.NEEDLE, f"{c.throttle*100:3.0f}%"),
+            ("brake", c.brake * 100, 100.0, g.BAD, f"{c.brake*100:3.0f}%"),
+            ("boost", v.boost * 100, 100.0, g.BLUE, f"{v.boost*100:3.0f}%"),
+            ("fuelling", v.fuelling * 100, 100.0, g.WARN, f"{v.fuelling*100:3.0f}%"),
+            ("slip", v.wheelspin * 100, 100.0, g.BAD, f"{v.wheelspin*100:3.0f}%"),
+            ("fuel", v.fuel_l, 60.0, g.GOOD, f"{v.fuel_l:4.1f}l"),
+            ("coolant", v.coolant_c, 130.0,
+             g.GOOD if v.coolant_c < 110 else g.BAD, f"{v.coolant_c:3.0f}C"),
+            ("dimmer", c.dimmer, 255.0, g.WARN, f"{c.dimmer:3d}"),
+        ]
+        for label, val, vmax, colour, text in bars:
+            g.bar(s, f, x, ry, 150, label, val, vmax, colour, text)
+            ry += 24
+
+        ry += 10
         conn = self.link is not None and self.link.connected
         rows = [
-            ("link", f"{self.port_label} {'up' if conn else 'down'}", GOOD if conn else BAD),
-            ("frames", str(self.link.frames_sent if self.link else 0), DIM),
-            ("audio", self.engine.name, GOOD if self.engine.available else DIM),
-            ("terminal 15", "on" if c.ignition else "off", GOOD if c.ignition else DIM),
-            ("engine", "running" if v.running else "stopped", GOOD if v.running else BAD),
-            ("gearbox", f"{v.selector_name} {'auto' if c.auto else 'manual'}", DIM),
-            ("odometer", f"{v.odo_m / 1000.0:.2f} km (sim only)", DIM),
+            ("link", f"{self.port_label} {'up' if conn else 'down'}",
+             g.GOOD if conn else g.BAD),
+            ("frames", str(self.link.frames_sent if self.link else 0), g.LABEL),
+            ("audio", self.engine.name,
+             g.GOOD if self.engine.available else g.LABEL),
+            ("terminal 15", "on" if c.ignition else "off",
+             g.GOOD if c.ignition else g.LABEL),
+            ("engine", ("cranking" if v.cranking else
+                        "running" if v.running else "stopped"),
+             g.GOOD if v.running else g.BAD),
+            ("gearbox", f"{v.selector_name} {'auto' if c.auto else 'man'}"
+                        f"{' sport' if c.sport else ''}", g.LABEL),
+            ("gradient", f"{c.grade_pct:+.0f}%", g.LABEL),
+            ("accel", f"{v.accel_ms2:+5.2f} m/s2", g.LABEL),
         ]
-        for i, (name, val, colour) in enumerate(rows):
-            ry = y + i * 22
-            s.blit(self.small.render(name, True, DIM), (x, ry))
-            s.blit(self.small.render(val, True, colour), (x + 110, ry))
+        for label, val, colour in rows:
+            s.blit(f.render(label, True, g.LABEL), (x, ry))
+            s.blit(f.render(val, True, colour), (x + 108, ry))
+            ry += 20
+
         if self.link is not None and self.link.last_error:
-            err = self.small.render(self.link.last_error[:46], True, BAD)
-            s.blit(err, (x, y + len(rows) * 22 + 6))
+            s.blit(f.render(self.link.last_error[:34], True, g.BAD), (x, ry))
+            ry += 20
 
-    def _draw_log(self, s, x, y):
-        s.blit(self.small.render("firmware says", True, DIM), (x, y - 20))
-        box = pygame.Rect(x, y, 660, 160)
-        pygame.draw.rect(s, PANEL, box, border_radius=6)
-        pygame.draw.rect(s, EDGE, box, 1, border_radius=6)
-        for i, ln in enumerate(self.log[-8:]):
-            s.blit(self.small.render(ln[:88], True, DIM), (x + 10, y + 8 + i * 18))
+        ry += 8
+        s.blit(f.render("firmware", True, g.LABEL), (x, ry))
+        ry += 18
+        box = pygame.Rect(x, ry, WIDTH - x - 28, HEIGHT - ry - 24)
+        pygame.draw.rect(s, (11, 12, 15), box, border_radius=5)
+        pygame.draw.rect(s, (40, 44, 52), box, 1, border_radius=5)
+        lines = max(1, box.h // 17)
+        for i, ln in enumerate(self.log[-lines:]):
+            s.blit(f.render(ln[:38], True, g.LABEL), (box.x + 7, box.y + 5 + i * 17))
 
+    # -- help ---------------------------------------------------------------
     def _draw_help(self, s):
-        w, h = 300, 2 + len(HELP) * 20
-        box = pygame.Rect(WIDTH - w - 16, HEIGHT - h - 16, w, h)
+        """Centred modal overlay.
+
+        It used to sit bottom-left, where it covered the tacho and three of
+        the telltales - so it is a dimmed-backdrop modal now, off by default.
+        """
+        f = self.fonts["small"]
+        backdrop = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        backdrop.fill((0, 0, 0, 170))
+        s.blit(backdrop, (0, 0))
+
+        cols = 2
+        rows = (len(HELP) + cols - 1) // cols
+        col_w, row_h = 300, 21
+        w = cols * col_w + 36
+        h = rows * row_h + 56
+        box = pygame.Rect((WIDTH - w) // 2, (HEIGHT - h) // 2, w, h)
         panel = pygame.Surface((box.w, box.h), pygame.SRCALPHA)
-        panel.fill((20, 22, 28, 235))
+        panel.fill((14, 15, 20, 246))
         s.blit(panel, box.topleft)
-        pygame.draw.rect(s, EDGE, box, 1, border_radius=6)
+        pygame.draw.rect(s, (62, 68, 80), box, 1, border_radius=8)
+
+        title = self.fonts["readout"].render("controls", True, g.NUMERAL)
+        s.blit(title, (box.x + 18, box.y + 14))
         for i, (key, what) in enumerate(HELP):
-            ry = box.y + 4 + i * 20
-            s.blit(self.small.render(key, True, ACCENT), (box.x + 10, ry))
-            s.blit(self.small.render(what, True, DIM), (box.x + 112, ry))
+            cx = box.x + 18 + (i // rows) * col_w
+            ry = box.y + 48 + (i % rows) * row_h
+            s.blit(f.render(key, True, g.NEEDLE), (cx, ry))
+            s.blit(f.render(what, True, g.LABEL), (cx + 96, ry))
 
     # -- firmware console ---------------------------------------------------
     def pump_log(self) -> None:
