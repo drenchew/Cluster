@@ -38,6 +38,14 @@ MAP_SIZE = 32 * 1024          # SCS_PLUGIN_MMF_SIZE
 SHM_NAME = "SCSTelemetry"     # POSIX name; Windows wants the Local\ prefix
 BYTES_UPTO_ZONE10 = 4000      # offset of the first zone we treat as opaque
 
+# The struct below mirrors PLUGIN_REVID 12. Revision 13 only appends a zone
+# and keeps every revision-12 offset, so it reads fine too. Anything else may
+# have moved a field under us - verify_layout() cannot catch that, because it
+# only checks our own struct against our own constants. The plugin publishes
+# its revision in the block, so check it at runtime instead.
+EXPECTED_REVID = 12
+SUPPORTED_REVIDS = (12, 13)
+
 # The shared-memory object's name is NOT standard across plugin forks. The
 # struct layout is the same everywhere, but the name is not:
 #   truckermudgeon / upstream   /dev/shm/SCSTelemetry
@@ -470,6 +478,8 @@ class ShmSource:
         self._last_move = 0.0
         self.name: str | None = None      # whichever candidate actually opened
         self.last_error: str | None = None
+        self.revid: int | None = None     # plugin revision, once we have seen one
+        self.revid_warning: str | None = None
 
     # -- plumbing ----------------------------------------------------------
     def _open(self) -> None:
@@ -528,7 +538,22 @@ class ShmSource:
             self._last_move = time.monotonic()
         if not frame.sdkActive or (time.monotonic() - self._last_move) > self._stale_s:
             return None
+        self._check_revid(frame)
         return frame
+
+    def _check_revid(self, frame: ScsTelemetry) -> None:
+        """Compare the plugin's own revision against what this struct mirrors."""
+        rev = int(frame.scs_values.telemetry_plugin_revision)
+        if rev == self.revid:
+            return
+        self.revid = rev
+        if rev in SUPPORTED_REVIDS:
+            self.revid_warning = None
+        else:
+            self.revid_warning = (
+                f"plugin reports revision {rev}, this reader mirrors "
+                f"{EXPECTED_REVID} - fields may be misaligned. Use a "
+                f"v1.12.x plugin, or check scs-telemetry-common.hpp.")
 
 
 class MockSource:

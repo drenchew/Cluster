@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     next_status = time.monotonic()
     live_prev: bool | None = None
     frames = 0
+    warned: str | None = None
     status = "starting"
 
     port_txt = "disabled" if args.no_serial else (
@@ -129,6 +130,12 @@ def main(argv: list[str] | None = None) -> int:
                 frames += 1
                 status = _describe(sp)
                 live = True
+                # A plugin whose struct revision we do not mirror would feed
+                # plausible-looking nonsense, so say it once and loudly.
+                warn = getattr(source, "revid_warning", None)
+                if warn and warn != warned:
+                    warned = warn
+                    print(f"WARNING: {warn}", file=sys.stderr, flush=True)
             else:
                 live = False
                 err = source.last_error or "game not producing frames"
@@ -151,8 +158,15 @@ def main(argv: list[str] | None = None) -> int:
                     link_state = link.last_error
                 else:
                     link_state = "not opened yet"
-                print(f"{_stamp()}  {status}   [{frames} frames, link {link_state}]",
-                      flush=True)
+                extra = ""
+                name = getattr(source, "name", None)
+                rev = getattr(source, "revid", None)
+                if live and name:
+                    extra = f", {name}"
+                    if rev is not None:
+                        extra += f" rev{rev}"
+                print(f"{_stamp()}  {status}   "
+                      f"[{frames} frames, link {link_state}{extra}]", flush=True)
                 frames = 0
     except KeyboardInterrupt:
         pass

@@ -273,7 +273,38 @@ the game's shared memory and pushes the usual 50 Hz setpoints at `link.py`.
 ### Getting the data out of the game
 
 The game does not publish telemetry itself — the community **SCS SDK plugin**
-does. Install it, then:
+does.
+
+### Which plugin
+
+Use **[truckermudgeon/scs-sdk-plugin](https://github.com/truckermudgeon/scs-sdk-plugin/releases)**,
+asset `build-ubuntu-latest.zip` from the latest release (v1.12.1). It is the
+right one on three counts that matter here:
+
+- **Prebuilt Linux `.so`** — no toolchain needed.
+- **Plugin revision 12**, which is exactly the struct `ets2.py` mirrors.
+- **Shared memory at `/SCSTelemetry`**, the first name the reader tries.
+
+Alternatives, in case that one goes stale:
+
+| fork | Linux binary | revision | shm name |
+|---|---|---|---|
+| [truckermudgeon](https://github.com/truckermudgeon/scs-sdk-plugin) | `build-ubuntu-latest.zip` | 12 | `/SCSTelemetry` |
+| [SimuLogistics](https://github.com/SimuLogistics/scs-sdk-plugin) | `SimuLogistics-Telemetry.so` | 13 (rev-12 offsets kept, zone appended) | `/SimuLogisticsTelemetry` |
+| [RenCloud](https://github.com/RenCloud/scs-sdk-plugin) (upstream) | none — Windows only | 12 | `Local\SCSTelemetry` |
+
+Both working options are already in the reader's name-candidate list, so
+either is picked up without `--shm-name`. Avoid the older mmap forks
+(jackz314, alxwk, y1lichen) — their compatibility tables stop around ETS2
+1.36.
+
+The reader checks the plugin's own `telemetry_plugin_revision` at runtime and
+prints a warning if it is not one it mirrors. That matters because
+`--selftest` can only prove the struct is self-consistent; it cannot know what
+the *running* plugin publishes. Revisions 12 and 13 are accepted silently,
+anything else warns but still runs.
+
+Install it, then:
 
 - **Linux (native build):** drop the plugin `.so` into
   `<ETS2>/bin/linux_x64/plugins/` (create `plugins/` if it is not there),
