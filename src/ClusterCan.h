@@ -46,6 +46,22 @@ public:
   void setOutsideC(int16_t celsius);
   void setRangeKm(uint16_t km);
 
+  // ---- DSC / traction control -------------------------------------------
+  // These are check-control symbols on 0x592, not dedicated frames: see
+  // cfg::sym. tcLamp is the "DTC"/traction-mode lamp, dscLamp is the DSC
+  // triangle the real car flashes while it is actually intervening (the host
+  // does the flashing - it knows when an intervention started), dscOff is the
+  // solid lamp for DSC switched off.
+  void setTractionLamps(bool tcLamp, bool dscLamp, bool dscOff);
+  void setSymbol(uint16_t id, bool on);   // any id from the E92 symbol list
+
+  // ---- clock -------------------------------------------------------------
+  // A cluster that was never told the time shows no clock at all. Seconds are
+  // advanced locally off millis() between host updates, so the clock keeps
+  // running (and keeps being sent) even with the USB cable out.
+  void setClock(uint8_t hour, uint8_t minute, uint8_t second,
+                uint8_t day, uint8_t month, uint16_t year);
+
   // ---- body / lighting ---------------------------------------------------
   void setLights(uint8_t mask);         // cfg::LIGHT_* bits
   void setDimmer(uint8_t level);        // 0..255 instrument illumination
@@ -67,10 +83,42 @@ public:
   uint8_t  speedSources() const { return speedSrc_; }
   bool     handbrake() const { return handbrake_; }
   bool     engineRunning() const { return engineOn_; }
+  bool     clockValid() const { return clockValid_; }
+  uint8_t  clockHour() const { return hour_; }
+  uint8_t  clockMin()  const { return min_; }
+  uint8_t  clockSec()  const { return sec_; }
+  uint8_t  clockDay()  const { return day_; }
+  uint8_t  clockMonth()const { return month_; }
+  uint16_t clockYear() const { return year_; }
+  // What the cluster itself last broadcast, or absent if it has not. The
+  // temperature is in tenths of a degree C so AVR printf (which has no %f)
+  // can print it; see cfg::REPORT_CLUSTER_RX.
+  bool     kombiTempKnown() const {
+    return kombiTempSeen_ && (millis() - kombiTempMs_) < KOMBI_RX_FRESH_MS;
+  }
+  // The cluster broadcasts 0xFF for "no reading" - which is what an open
+  // sensor across pins 4 and 5 gives, and the reason the display sits at the
+  // bottom of its scale. Decoded it would be a nonsensical +87.5 C.
+  bool     kombiTempValid() const { return kombiTempRaw_ != 0xFF; }
+  // Likewise 0xFD on 0x2F8: the clock has never been set.
+  bool     kombiClockValid() const {
+    return kombiH_ < 24 && kombiM_ < 60 && kombiS_ < 60;
+  }
+  int16_t  kombiTempDeciC() const { return kombiTempDeciC_; }
+  bool     kombiClockKnown() const {
+    return kombiClockSeen_ && (millis() - kombiClockMs_) < KOMBI_RX_FRESH_MS;
+  }
+  void     kombiClock(uint8_t &h, uint8_t &m, uint8_t &s2) const {
+    h = kombiH_; m = kombiM_; s2 = kombiS_;
+  }
   bool     terminal15()    const { return kl15_; }
   Stats    stats() const { return {txOk_, txFail_, rx_}; }
 
 private:
+  // A cluster that has been switched off stops broadcasting; its last reading
+  // must not go on being reported as current.
+  static const uint32_t KOMBI_RX_FRESH_MS = 10000;
+
   uint8_t rawReadReg(uint8_t addr);     // diagnostic raw SPI read
   bool    tryInit();
   bool    send(uint32_t id, const uint8_t *data, uint8_t len);
@@ -98,6 +146,12 @@ private:
   void send3B0();   // 0x3B0 reverse gear
   void send366();   // 0x366 outside temp + range
   void send34F();   // 0x34F handbrake status (2 bytes, event + 5 s)
+  void send39E();   // 0x39E time + date (sets the cluster clock)
+  void send592(uint16_t id, bool on);   // 0x592 check-control symbol
+  void pumpSymbols();                   // one due 0x592 frame per call
+  void tickClock(uint32_t now);         // advance the local clock
+  void slewFuel(uint32_t now);          // damp host fuel steps, like a tank
+  uint16_t fuelCounts(float frac, bool right) const;
 
   MCP2515 mcp_{cfg::PIN_CS, cfg::SPI_HZ};
 
@@ -125,6 +179,45 @@ private:
   volatile uint8_t  odoMode_    = cfg::ODO_MODE;
   volatile uint8_t  speedSrc_   = cfg::SPEED_SOURCES;
   volatile uint32_t txOk_ = 0, txFail_ = 0, rx_ = 0;
+
+  // ---- clock -------------------------------------------------------------
+  volatile uint8_t  hour_  = cfg::CLOCK_BOOT_HOUR;
+  volatile uint8_t  min_   = cfg::CLOCK_BOOT_MIN;
+  volatile uint8_t  sec_   = 0;
+  volatile uint8_t  day_   = cfg::CLOCK_BOOT_DAY;
+  volatile uint8_t  month_ = cfg::CLOCK_BOOT_MONTH;
+  volatile uint16_t year_  = cfg::CLOCK_BOOT_YEAR;
+  volatile bool     clockValid_ = false;   // true once anything set the time
+  uint32_t lastSecMs_ = 0;                 // millis() of the last second tick
+  uint32_t lastClock_ = 0;                 // millis() of the last 0x39E
+
+  // ---- 0x592 check-control symbols ---------------------------------------
+  enum : uint8_t { SYM_DTC = 0, SYM_DSC, SYM_DSC_OFF, SYM_EXTRA, SYM_COUNT };
+  struct SymSlot {
+    uint16_t id;
+    bool     want;      // what the host asked for
+    bool     sent;      // what the bus has been told
+    uint32_t lastMs;    // millis() of the last frame for this slot
+  };
+  SymSlot sym_[SYM_COUNT] = {
+    {cfg::sym::DTC,          false, false, 0},
+    {cfg::sym::DSC_TRIANGLE, false, false, 0},
+    {cfg::sym::DSC_OFF,      false, false, 0},
+    {0,                      false, false, 0},   // setSymbol() scratch slot
+  };
+  uint8_t symCursor_ = 0;
+
+  // ---- fuel slew ---------------------------------------------------------
+  float    fuelShown_  = -1.0f;   // litres actually on the bus, < 0 = unset
+  uint32_t lastFuelMs_ = 0;
+
+  // ---- what the cluster told us (0x2CA / 0x2F8) --------------------------
+  bool    kombiTempSeen_  = false;
+  uint8_t kombiTempRaw_   = 0xFF;
+  int16_t kombiTempDeciC_ = 0;
+  bool    kombiClockSeen_ = false;
+  uint8_t kombiH_ = 0, kombiM_ = 0, kombiS_ = 0;
+  uint32_t kombiTempMs_ = 0, kombiClockMs_ = 0;
 
   // ---- scheduler + rolling counters --------------------------------------
   uint32_t lastTick_ = 0;

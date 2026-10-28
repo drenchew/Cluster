@@ -70,4 +70,13 @@ void Protocol::apply(ClusterCan &can) {
   can.setDimmer(s.dimmer);
   can.setTurn((s.turn & 0x01) != 0, (s.turn & 0x02) != 0);
   can.setGear(s.gearPos, s.gearNum, s.gearMode);
+
+  can.setTractionLamps((s.flags2 & HF2_TC_LAMP) != 0,
+                       (s.flags2 & HF2_DSC_LAMP) != 0,
+                       (s.flags2 & HF2_DSC_OFF) != 0);
+
+  // An older host, or one with no clock of its own, simply leaves the flag
+  // clear and the cluster keeps running the clock it already has.
+  if (s.flags2 & HF2_CLOCK)
+    can.setClock(s.hour, s.minute, s.second, s.day, s.month, s.year);
 }

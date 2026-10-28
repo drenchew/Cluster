@@ -11,3 +11,6 @@ compile_commands.json
 __pycache__/
 *.py[cod]
 host/samples/
+
+# plugin build output
+plugin/plugins/

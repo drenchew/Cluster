@@ -19,6 +19,10 @@ What makes a diesel feel like a diesel, and what this models:
   road. Shifts are a slew towards a computed target, not a teleport.
 * **Traction limit.** Drive force is capped by what the rear tyres can take,
   and the surplus torque spins the engine up instead of the car.
+* **Traction control.** Slip past the threshold and DSC pulls fuelling, which
+  is why a hard launch on a rear-drive car comes out as a series of surges
+  rather than one long wheelspin. Three modes, as the real console switch
+  gives: DSC on, DTC (traction mode, slip allowed), DSC off (no intervention).
 
 Everything is SI internally; the GUI and the CAN link convert at the edges.
 """
@@ -107,10 +111,47 @@ FRICTION_COEFF = 0.009      # internal engine drag, Nm per rpm
 # car down - and that is what limits a launch on boost.
 TYRE_MU = 1.05
 REAR_WEIGHT_FRAC = 0.52
+# A spinning tyre grips less than one that is still hooked up - sliding
+# friction is below static. Without this the sim clips drive force at the grip
+# limit and a wheelspinning launch accelerates exactly as hard as a clean one,
+# which leaves traction control with nothing to be worth. 0.3 puts a fully
+# spinning rear axle at about 0.74 mu against 1.05 stuck.
+TYRE_SPIN_MU_LOSS = 0.30
 
-# Deliberately unrealistic: a correct burn rate drains 0.07 l a minute, which
-# is 0.1% of the gauge, so on a bench the fuel needle looks frozen. This scales
-# only the tank level, not the l/100km readout, which stays honest.
+# ---- DSC / traction control -----------------------------------------------
+# A real E9x has one console button: a press gives DTC (traction mode, which
+# lets the car slip for a snow pull-away or a bit of fun), press-and-hold gives
+# DSC off. The threshold is on ``wheelspin``, i.e. how far past the tyres'
+# grip limit the driveline is asking them to go.
+DSC_ON, DSC_DTC, DSC_OFF = 0, 1, 2
+DSC_MODE_NAMES = ("DSC", "DTC", "off")
+# None = this mode never intervenes.
+TC_SLIP_LIMIT = (0.04, 0.30, None)
+TC_CUT_RATE = 7.0           # how fast fuelling is pulled, fraction per second
+TC_RELEASE_RATE = 2.2       # and handed back, which is slower - no see-sawing
+TC_MAX_CUT = 0.85           # DSC never cuts the engine completely
+TC_LAMP_HOLD = 0.35         # s the lamp stays up after the cut ends, so a
+                            # 50 ms intervention is still visible as a flash
+
+# ---- Fuel -----------------------------------------------------------------
+FUEL_TANK_L = 60.0          # E90 320d is 61 l; the cluster curve is scaled to this
+FUEL_RESERVE_L = 8.0        # low-fuel warning on a real E9x comes up here
+REFUEL_L_PER_S = 0.6        # ~36 l/min, a European diesel pump
+
+# Fuel is burned from the power the engine is actually making, not from pedal
+# position: litres/hour = idle draw + crank kW / (energy in a litre x thermal
+# efficiency). Diesel holds 9.8 kWh/l and a modern turbodiesel converts about a
+# third of that to crank power, which puts a 90 km/h cruise at ~4 l/100km and
+# full throttle at ~65 l/h - both about right for this car.
+DIESEL_KWH_PER_L = 9.8
+ENGINE_EFFICIENCY = 0.33
+IDLE_L_PER_HOUR = 0.65
+
+# A correct burn rate drains about 0.1 l a minute at a cruise, which is 0.16%
+# of the gauge - real, but on a bench the needle looks frozen. The sim runs at
+# the true rate by default now that the tank can be filled and set from the
+# keyboard; ``Controls.fuel_fast`` multiplies the *tank* drain by this so the
+# gauge visibly moves, and leaves the l/100km readout honest either way.
 FUEL_BURN_SCALE = 25.0
 
 # ---------------------------------------------------------------------------
@@ -187,6 +228,9 @@ class Controls:
     auto: bool = True
     sport: bool = False
     grade_pct: float = 0.0      # road gradient, percent. +uphill, -downhill
+    dsc_mode: int = DSC_ON      # DSC_ON / DSC_DTC / DSC_OFF
+    refuel: bool = False        # held while the pump is running
+    fuel_fast: bool = False     # drain the tank FUEL_BURN_SCALE times as fast
     lights_step: int = 1        # 0 off, 1 side, 2 low beam, 3 + high beam
     fog_front: bool = False
     fog_rear: bool = False
@@ -213,6 +257,8 @@ class Vehicle:
     boost: float = 0.0          # 0..1 fraction of full boost
     fuelling: float = 0.0       # 0..1 actual injected fuelling after cuts
     wheelspin: float = 0.0      # 0..1 how far past the traction limit we are
+    tc_cut: float = 0.0         # 0..1 fuelling DSC is currently taking away
+    tc_lamp: float = 0.0        # >0 while the intervention lamp should be lit
     pop: float = 0.0            # 0..1 overrun crackle intensity
     cranking: bool = False
     accel_ms2: float = 0.0
@@ -233,6 +279,7 @@ class Vehicle:
     _lockout: float = 0.0
     _shift_shock: float = 0.0
     _prev_boost: float = 0.0
+    _fuel_torque: float = 0.0   # Nm the fuelling is producing, for _burn()
     controls: Controls = field(default_factory=Controls)
 
     # -- derived ------------------------------------------------------------
@@ -273,6 +320,23 @@ class Vehicle:
         return max(self.fuelling, 0.05)
 
     @property
+    def tc_active(self) -> bool:
+        """True while DSC is intervening - what flashes the lamp."""
+        return self.tc_lamp > 0.0
+
+    @property
+    def low_fuel(self) -> bool:
+        return self.fuel_l <= FUEL_RESERVE_L
+
+    @property
+    def fuel_frac(self) -> float:
+        return max(0.0, min(1.0, self.fuel_l / FUEL_TANK_L))
+
+    @property
+    def dsc_name(self) -> str:
+        return DSC_MODE_NAMES[self.controls.dsc_mode]
+
+    @property
     def range_km(self) -> float:
         if self.l_per_100km > 0.5:
             return self.fuel_l / self.l_per_100km * 100.0
@@ -304,6 +368,8 @@ class Vehicle:
             self._lockout -= dt
         if self._shift_shock > 0.0:
             self._shift_shock = max(0.0, self._shift_shock - dt * 6.0)
+
+        self._refuel(dt)
 
         if not c.ignition:
             self.running = False
@@ -414,7 +480,8 @@ class Vehicle:
         barely able to accelerate and the gearbox stuck in first.
         """
         air = NA_TORQUE_FRAC + (1.0 - NA_TORQUE_FRAC) * self.boost
-        t = torque_at(self.rpm) * min(demand, air)
+        self._fuel_torque = torque_at(self.rpm) * min(demand, air)
+        t = self._fuel_torque
         t -= FRICTION_COEFF * self.rpm
         if demand <= 0.02:
             t -= ENGINE_BRAKE_COEFF * self.rpm
@@ -425,6 +492,14 @@ class Vehicle:
         self.cranking = False
 
         demand = self._demand()
+        # DSC acts on the slip it measured last frame - a real one is reacting
+        # to wheel-speed sensors too, not predicting. Pulling fuelling here
+        # rather than clipping drive force further down is what a real system
+        # does, and it means the audio hears the cut: self.fuelling is what the
+        # exhaust note is built from.
+        self._update_traction(dt)
+        if self.tc_cut > 0.0:
+            demand *= 1.0 - self.tc_cut
         self._update_boost(dt, demand)
         # A wastegate dump happens when boost was up and the demand just
         # vanished. This has to be tested *after* the boost update - comparing
@@ -481,6 +556,8 @@ class Vehicle:
         # Traction limit: the rear axle can only put down so much, and the
         # surplus spins the engine rather than the car.
         grip_f = TYRE_MU * MASS * 9.81 * REAR_WEIGHT_FRAC
+        if self.wheelspin > 0.0:
+            grip_f *= 1.0 - TYRE_SPIN_MU_LOSS * min(1.0, self.wheelspin)
         drive_f = drive_torque / WHEEL_RADIUS
         if abs(drive_f) > grip_f:
             excess = abs(drive_f) - grip_f
@@ -512,14 +589,50 @@ class Vehicle:
         self.rpm += (target - self.rpm) * k
         self.wheelspin = 0.0
 
+    # -- DSC ----------------------------------------------------------------
+    def _update_traction(self, dt: float) -> None:
+        """Ramp the fuelling cut up while the tyres are past their limit.
+
+        A ramp rather than a switch: DSC does not cut 85% of the engine the
+        instant a wheel slips, it feeds the cut in and hands it back slowly,
+        which is what makes a traction-limited launch surge instead of either
+        bogging or spinning. Handing it back slower than it goes on is what
+        stops the two fighting each other at the threshold.
+        """
+        self.tc_lamp = max(0.0, self.tc_lamp - dt)
+
+        limit = TC_SLIP_LIMIT[self.controls.dsc_mode]
+        if limit is None or not self.running:
+            self.tc_cut = max(0.0, self.tc_cut - dt * TC_RELEASE_RATE)
+            return
+
+        if self.wheelspin > limit:
+            over = min(1.0, (self.wheelspin - limit) / 0.25)
+            self.tc_cut = min(TC_MAX_CUT,
+                              self.tc_cut + dt * TC_CUT_RATE * (0.3 + over))
+        else:
+            self.tc_cut = max(0.0, self.tc_cut - dt * TC_RELEASE_RATE)
+
+        if self.tc_cut > 0.02:
+            self.tc_lamp = TC_LAMP_HOLD
+
+    # -- fuel ---------------------------------------------------------------
+    def _refuel(self, dt: float) -> None:
+        if self.controls.refuel:
+            self.fuel_l = min(FUEL_TANK_L, self.fuel_l + REFUEL_L_PER_S * dt)
+
     def _burn(self, dt: float, demand: float) -> None:
-        # Idle draw plus a term that grows with fuelling and revs.
-        l_per_hour = 0.42 + 7.5 * demand * (self.rpm / 2500.0)
-        # The tank drains at FUEL_BURN_SCALE times the real rate so the gauge
-        # visibly moves on a bench; the l/100km readout below uses the true
-        # rate, so what is displayed stays honest.
+        # Burned from the power actually being made - torque x revs - so the
+        # consumption answers to load rather than to pedal travel. Idling, in
+        # gear uphill and flat out in sixth all come out where they should.
+        power_kw = max(0.0, self._fuel_torque) * self.rpm / 9549.0
+        l_per_hour = IDLE_L_PER_HOUR + power_kw / (DIESEL_KWH_PER_L
+                                                   * ENGINE_EFFICIENCY)
+        # The l/100km readout below always uses the true rate; only the tank
+        # level is sped up, and only when asked for (Controls.fuel_fast).
+        scale = FUEL_BURN_SCALE if self.controls.fuel_fast else 1.0
         self.fuel_l = max(0.0, self.fuel_l
-                          - l_per_hour * FUEL_BURN_SCALE / 3600.0 * dt)
+                          - l_per_hour * scale / 3600.0 * dt)
         kmh = abs(self.speed_kmh)
         inst = (l_per_hour / kmh * 100.0) if kmh > 3.0 else 0.0
         self.l_per_100km += (min(inst, 40.0) - self.l_per_100km) * min(1.0, dt * 0.7)
@@ -673,6 +786,10 @@ class Vehicle:
     @property
     def selector_name(self) -> str:
         return SELECTOR_NAMES[self.controls.selector]
+
+    def cycle_dsc(self) -> None:
+        """DSC on -> DTC -> DSC off -> on, as the console button would."""
+        self.controls.dsc_mode = (self.controls.dsc_mode + 1) % 3
 
     def reset_trip(self) -> None:
         self.trip_m = 0.0

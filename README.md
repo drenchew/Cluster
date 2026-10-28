@@ -60,8 +60,22 @@ n 1      turn: 0 off, 1 left, 2 right, 3 hazard
 h 0|1    handbrake          e 0|1   engine running      k 0|1  terminal 15
 o 0|1|2  0x1A6 distance accumulator: frozen / alive / distance
 x 0..3   extra speed frames: +1 = 0x1A0, +2 = 0x0CE (both on by default)
+w 1435   set the clock, HHMM or HHMMSS       (0x39E)
+u 0..7   traction lamps: +1 DTC, +2 DSC triangle, +4 DSC off  (0x592)
+y 357 1  raise (1) or clear (0) any check-control symbol by id (0x592)
 d        resume demo sweep  ?       print state
 ```
+
+Every five seconds the firmware also prints what the **cluster** is saying
+about itself, which is the quickest way to see whether the clock took and what
+the thermometer really reads:
+
+```
+kombi: outside 10.5C clock 14:32:07
+```
+
+That line comes from 0x2CA and 0x2F8, which the KOMBI transmits — see
+[The on-board computer](#the-on-board-computer-temperature-and-clock).
 
 ### If the speedometer needle will not move
 
@@ -147,8 +161,12 @@ that stiff is already marginal, and one dropped frame makes it diverge.
 | `1`–`6` | select a gear directly |
 | `L` | lights: off → side → low → high |
 | `F` / `V` | front / rear fog |
+| `C` | DSC: on → DTC (traction mode) → off |
 | `[` / `]` | dimmer down / up (visibly dims the panel, as the real one does) |
-| `-` / `=` | fuel down / up |
+| `-` / `=` | fuel down / up, 5 l a press |
+| `R` | hold to refuel, 36 l/min |
+| `X` | fuel drain: real time ↔ ×25 so the needle visibly moves |
+| `;` / `'` | outside temperature down / up |
 | `,` / `.` | road gradient down / up |
 | `T` | reset trip |
 | `P` | sport shift map |
@@ -203,15 +221,123 @@ off the pedal at 1500 rpm.
 (`TYRE_MU × mass × g × REAR_WEIGHT_FRAC` ≈ 8 kN) and the surplus spins the
 engine instead of the car. First gear at the torque peak asks for 14.5 kN, so
 with 500 Nm this now bites on a launch — it did not at the original 340 Nm.
+A spinning tyre also grips *less* than a hooked-up one (`TYRE_SPIN_MU_LOSS`,
+0.3), which is what makes wheelspin cost time rather than being free.
 
 **Road gradient** (`,` / `.`) up to ±20%, which is the quickest way to load the
 engine without needing road speed.
 
-**Fuel burn is deliberately exaggerated.** `FUEL_BURN_SCALE` (25×) drains the
-tank fast enough that the gauge visibly moves on a bench. At the true rate a
-minute of driving burns 0.07 l — 0.1% of the gauge — so the needle looks
-frozen and the gauge appears broken. The scale applies only to the tank level;
-the l/100km readout uses the real rate and stays honest.
+### Traction control
+
+`C` cycles the three positions of the real car's console button:
+
+| mode | slip allowed | lamp |
+|---|---|---|
+| **DSC** | 4% | DSC triangle flashes while intervening |
+| **DTC** (traction mode) | 30% | `DTC` lit steady, triangle still flashes |
+| **DSC off** | — no intervention at all | `DSC OFF` lit steady |
+
+What intervenes is the engine, not the brakes: the controller ramps a fuelling
+cut in at `TC_CUT_RATE` (up to 85%) while the driveline is asking the tyres for
+more than they have, and hands it back slower than it takes it away
+(`TC_RELEASE_RATE`) so the two do not see-saw at the threshold. Because the cut
+lands on `fuelling`, the **audio hears it** — a traction-limited launch comes
+out as the surging note a real one has, not a flat full-throttle pull.
+
+It acts on the slip measured the frame before, like a real system reacting to
+wheel-speed sensors rather than predicting. Measured over a standing start:
+
+| mode | peak slip | slip-seconds | 0–50 km/h |
+|---|---|---|---|
+| DSC | 0.95 | 0.13 | 4.48 s |
+| DTC | 0.97 | 0.61 | 4.52 s |
+| off | 1.00 | 3.10 | 5.11 s |
+
+On the cluster these are **check-control symbols on 0x592**, not telltale bits:
+the E9x KOMBI has no "light the DSC lamp" signal, so the host raises symbol
+357 (`DTC`), 215 (DSC triangle) or 36 (`DSC OFF`) by number. The flashing is
+done on the host — the firmware only knows on and off, and the host is the end
+that knows an intervention started.
+
+### Fuel
+
+The tank is 60 l (`FUEL_TANK_L`), the reserve warning comes up at 8 l, and the
+level runs **at the real burn rate** by default: a cruise is about 0.1 l a
+minute, so the needle genuinely barely moves. `X` switches to a ×25 bench
+drain when you want to watch it fall, `-`/`=` jump the level 5 l at a time, and
+`R` holds a 36 l/min pump against it. The l/100km readout always uses the true
+rate, whichever drain is selected.
+
+Fuel is burned from the power the engine is making — crank kW over the energy
+in a litre of diesel times the thermal efficiency — rather than from pedal
+travel, so load decides consumption. That lands a 90 km/h cruise at 6.6
+l/100km, 130 km/h at 9.0, idle at 0.9 l/h and full throttle near 65 l/h. The
+old pedal-position formula read 1.5 l/100km at every cruise.
+
+**The gauge is not linear, and the two senders disagree.** The tank is a saddle
+tank with a sender in each half, and 0x349 carries both as 16-bit counts. The
+flat 160 counts/litre this jig used to send is only right for the left sender
+near full; the real breakpoints (from the veikkos driver) are
+
+| fill | 100% | 87.5% | 75% | 50% | 25% | 0% |
+|---|---|---|---|---|---|---|
+| left | 9700 | 8200 | 6250 | 3600 | 1950 | 625 |
+| right | 8400 | 5400 | 4600 | 3350 | 2200 | 950 |
+
+which `ClusterCan::fuelCounts()` interpolates (`cfg::FUEL_CURVE_REAL = false`
+goes back to the flat scaling if you want to compare them on the bench). The
+firmware also slews what it sends at 1.5%/s (`FUEL_SLEW_FRAC_PER_S`): one
+keypress moves the setpoint 5 l, no real sender can do that, and a step that
+large reads to the cluster as a refuelling event.
+
+### The on-board computer: temperature and clock
+
+Two things a fresh bench cluster gets wrong, and neither is a missing frame
+you forgot to send.
+
+**“−40” is an open circuit, not a CAN value.** The outside temperature does
+not come off the bus at all — the cluster measures it itself, through an NTC
+across connector **pins 4 and 5**. With nothing wired there the input reads
+open and the display pegs at the bottom of its scale, which is −40 in both
+units (that the C and F numbers agree is the giveaway). The sensor is 5 kΩ at
+25 °C with β = 3950:
+
+```
+cd host
+python3 ambient_resistor.py              # the whole table
+python3 ambient_resistor.py --temp 18    # 6.8 kΩ reads +18.2 C / 65 F
+python3 ambient_resistor.py --ohms 10000 # 10 k reads +10.2 C / 50 F
+```
+
+10 kΩ across pins 4 and 5 is the usual bench choice: about 10 °C, warm enough
+to clear the cold-weather warning. A trimpot lets you play with it; a digital
+potentiometer (AD5272, as in the veikkos driver) lets the host drive it. Note
+the cluster filters this input hard — a change takes a minute or two to reach
+the display and does not move at all with KL15 off.
+
+The `t` console command and `;`/`'` in the GUI only change what goes out on
+0x366, which is **off by default** because the DBC names the KOMBI as that
+frame's sender; the GUI's own readout shows both units so you can compare it
+against what the cluster displays.
+
+**No clock means nothing ever told it the time.** In a car the CAS, iDrive or
+GPS sets it; on a bench nothing does, and a cluster that has never been given
+the time shows no clock at all. `0x39E` is the frame that sets it, and the jig
+now sends it once a second — the simulator from the PC clock, `run_ets2.py`
+from the in-game clock by default (`--clock game|system|off`), and the
+firmware keeps the clock running off `millis()` between host updates so
+unplugging the USB cable does not freeze it. `w 1435` sets it by hand.
+
+The cluster then broadcasts what it believes on **0x2F8**, and its measured
+temperature on **0x2CA**, both of which the firmware reads back and prints —
+so you can confirm the clock took without squinting at the LCD. Never
+*transmit* either: the KOMBI is their sender, and two nodes putting different
+data behind one identifier collide and produce bus errors.
+
+If the clock is set but the display still will not show it, that is the
+on-board computer's display mode rather than the bus. The BC menus are
+navigated by pulling **pin 16** to ground through 1 kΩ (enter), 2 kΩ (up) and
+3 kΩ (down).
 
 ### Engine audio
 
@@ -270,22 +396,93 @@ They get resampled and crossfaded by rpm. Force the choice with
 Truck Simulator) with no game-side hardware and no new wire protocol: it reads
 the game's shared memory and pushes the usual 50 Hz setpoints at `link.py`.
 
+### Just drive
+
+```sh
+./drive.sh
+```
+
+One command, from any state. It finds the game across every Steam library,
+rebuilds and reinstalls the plugin if a game update wiped it, opens up the
+serial port (asking for sudo only if it has to), runs the layout selftests,
+and then hands over to the bridge. `./drive.sh --check` reports without
+changing anything; `--launch` starts the game too; `--ats` does American
+Truck Simulator. Anything after `--` is passed to `run_ets2.py`:
+
+```sh
+./drive.sh --check
+./drive.sh --launch
+./drive.sh -- --rpm-scale 1.5 --tank-l 70
+```
+
+The rest of this section is what it does for you, and what to do when it
+cannot.
+
+#### Serial port permission, permanently
+
+The jig is an Arduino on a CH340 adapter, and `/dev/ttyUSB0` is created
+`root:dialout` mode 660 every time it is plugged in. A `chmod` is lost on the
+next replug; the permanent fix is to be in the group:
+
+```sh
+sudo usermod -aG dialout $USER
+```
+
+**Then log out and back in.** Linux stamps a session's group list at login,
+so until you do, `id` will not list `dialout` even though `/etc/group` has
+you in it — which looks exactly like the command not having worked. Check
+the file rather than the session:
+
+```sh
+getent group dialout        # you want your name on the end of this
+```
+
+`drive.sh` recognises that in-between state and re-runs itself under
+`sg dialout`, which starts a shell that does carry the group, so it works
+without sudo and without logging out. Once you have logged in again that
+step stops happening.
+
 ### Getting the data out of the game
 
-The game does not publish telemetry itself — the community **SCS SDK plugin**
-does.
+The game publishes nothing by itself: a plugin has to be loaded into it, which
+is then free to do what it likes with the numbers. This repo ships one, in
+[`plugin/`](plugin/), and it is what `run_ets2.py` expects by default.
 
-### Which plugin
+```sh
+cd plugin
+make            # build plugins/cluster-telemetry.so
+make test       # load and drive it with no game and no hardware
+make install    # copy it into the game's plugins folder
+```
 
-Use **[truckermudgeon/scs-sdk-plugin](https://github.com/truckermudgeon/scs-sdk-plugin/releases)**,
-asset `build-ubuntu-latest.zip` from the latest release (v1.12.1). It is the
-right one on three counts that matter here:
+Start the game, then check both ends:
 
-- **Prebuilt Linux `.so`** — no toolchain needed.
-- **Plugin revision 12**, which is exactly the struct `ets2.py` mirrors.
-- **Shared memory at `/SCSTelemetry`**, the first name the reader tries.
+```sh
+grep -i cluster-telemetry ~/.local/share/"Euro Truck Simulator 2"/game.log.txt
+cd host && python3 -m cluster_sim.ets2_plugin --watch
+```
 
-Alternatives, in case that one goes stale:
+It publishes a 512-byte block at `/dev/shm/ClusterTelemetry` once per
+simulation frame. [`plugin/README.md`](plugin/README.md) has the channel
+table, the seqlock, and how to add a field without breaking the reader;
+[`plugin/include/cluster_shm.h`](plugin/include/cluster_shm.h) is the layout
+itself, mirrored field for field by
+[`host/cluster_sim/ets2_plugin.py`](host/cluster_sim/ets2_plugin.py).
+
+Built and running against **ETS2 1.61.1.9**, telemetry API 1.21, native Linux
+x86_64. It needs only `libc.so.6` and asks for nothing newer than
+`GLIBC_2.4` — older than the game binary's own `GLIBC_2.6` — so it loads
+anywhere the game does, Steam Linux Runtime container included.
+
+### Using RenCloud's plugin instead
+
+If a machine already has the community **SCS SDK plugin**, `--source shm`
+reads that instead. It is a 32 KiB struct covering trailers, jobs and
+gameplay events, which `ets2.py` mirrors in full:
+
+```
+python3 run_ets2.py --source shm
+```
 
 | fork | Linux binary | revision | shm name |
 |---|---|---|---|
@@ -293,42 +490,44 @@ Alternatives, in case that one goes stale:
 | [SimuLogistics](https://github.com/SimuLogistics/scs-sdk-plugin) | `SimuLogistics-Telemetry.so` | 13 (rev-12 offsets kept, zone appended) | `/SimuLogisticsTelemetry` |
 | [RenCloud](https://github.com/RenCloud/scs-sdk-plugin) (upstream) | none — Windows only | 12 | `Local\SCSTelemetry` |
 
-Both working options are already in the reader's name-candidate list, so
-either is picked up without `--shm-name`. Avoid the older mmap forks
-(jackz314, alxwk, y1lichen) — their compatibility tables stop around ETS2
-1.36.
+Both Linux options are in the reader's name-candidate list, so either is
+picked up without `--shm-name`. Avoid the older mmap forks (jackz314, alxwk,
+y1lichen) — their compatibility tables stop around ETS2 1.36.
 
 The reader checks the plugin's own `telemetry_plugin_revision` at runtime and
-prints a warning if it is not one it mirrors. That matters because
-`--selftest` can only prove the struct is self-consistent; it cannot know what
-the *running* plugin publishes. Revisions 12 and 13 are accepted silently,
-anything else warns but still runs.
+warns if it is not one it mirrors. That matters because `--selftest` can only
+prove the struct is self-consistent; it cannot know what the *running* plugin
+publishes. Revisions 12 and 13 are accepted silently, anything else warns but
+still runs.
 
-Install it, then:
+**The object's name is not standardised across those forks.** Upstream and the
+truckermudgeon fork use `/dev/shm/SCSTelemetry`; ETS2LA's controller plugin
+uses a `/dev/shm/SCS/` subdirectory. So `run_ets2.py` tries the known names
+and then scans `/dev/shm` for anything of the right size. If it still misses
+yours:
 
-- **Linux (native build):** drop the plugin `.so` into
-  `<ETS2>/bin/linux_x64/plugins/` (create `plugins/` if it is not there),
-  start the game and accept the SDK consent dialog. It writes the whole
-  `scsTelemetryMap_t` struct into a 32 KiB POSIX shared-memory object and
-  refreshes it every frame.
+```
+python3 run_ets2.py --probe                  # what is actually in /dev/shm
+python3 run_ets2.py --shm-name MyBlockName   # or an absolute path
+```
 
-  **The object's name is not standardised across plugin forks.** Upstream and
-  the truckermudgeon fork use `/dev/shm/SCSTelemetry`; others use different
-  names, and ETS2LA's controller plugin uses a `/dev/shm/SCS/` subdirectory.
-  So `run_ets2.py` tries the known names and then scans `/dev/shm` for
-  anything of the right size. If it still misses yours:
+### Where the plugin goes, and what will not work
 
-  ```
-  python3 run_ets2.py --probe                  # what is actually in /dev/shm
-  python3 run_ets2.py --shm-name MyBlockName   # or an absolute path
-  ```
-- **Windows (native build):** same install under `bin\win_x64\plugins\`, and
-  the block is a named mapping **`Local\SCSTelemetry`**. `run_ets2.py` works
-  there too.
-- **Proton / Wine:** not supported. The Windows build's mapping lives inside
+| | plugins folder |
+|---|---|
+| Linux (native) | `<game>/bin/linux_x64/plugins/` |
+| Windows (native) | `<game>\bin\win_x64\plugins\` |
+
+Create `plugins/` if it is not there; `make install` does. On Windows the
+block is a named mapping `Local\SCSTelemetry` and `--source shm` works there
+too.
+
+- **Proton / Wine: not supported.** The Windows build's mapping lives inside
   the Wine prefix where no native Linux process can see it, and the Linux
-  build is a different install. A bridge process running *inside* the prefix
-  would be needed; this repo does not ship one.
+  build is a different install. A bridge running *inside* the prefix would be
+  needed; this repo does not ship one.
+- **macOS: not supported** — the reader expects POSIX shared memory in
+  `/dev/shm`, which macOS does not have.
 
 ### From Steam (the usual case)
 
@@ -356,15 +555,15 @@ It walks every Steam library (including extra drives via
    `flatpak override --user --device=shm com.valvesoftware.Steam`, then fully
    restart Steam.
 
-The plugin goes in `<game>/bin/linux_x64/plugins/` — create `plugins/` if it
-is not there. Typical Steam locations:
+Typical Steam locations for the plugins folder:
 
 ```
 ~/.local/share/Steam/steamapps/common/Euro Truck Simulator 2/bin/linux_x64/plugins/
 ~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/...   (Flatpak)
 ```
-- **macOS:** not supported — the reader expects POSIX shared memory in
-  `/dev/shm`, which macOS does not have.
+
+`make install` finds the first of those on its own; for the Flatpak install,
+or for ATS, pass `GAME_DIR=...`.
 
 ### Running it
 
@@ -421,6 +620,9 @@ not producing telemetry.
 | `truck.lightsParking / BeamLow / BeamHigh` | light telltales, 0x21A |
 | `truck.electricEnabled / engineEnabled` | KL15 + engine-on state |
 | `truck.gameThrottle` | pedal readout in the telemetry rail |
+| `truck.wheelVelocity × wheelRadius` vs `truck.speed` | driven-wheel slip → flashing DSC triangle, 0x592 |
+| `truck.differentialLock` | `DTC` lamp — the game's own traction aid, 0x592 |
+| `common.time_abs` (in-game minutes) | the clock, 0x39E (`--clock game|system|off`) |
 
 Three of those are deliberate compromises:
 
@@ -432,6 +634,13 @@ Three of those are deliberate compromises:
 - **Blinker *enable*, not lamp.** `truck.lblinker` is the logical switch and
   `truck.light.lblinker` is the 2 Hz lamp state. Feeding the lamp would
   re-kick the cluster's own 0x1F6 flasher every frame.
+
+Traction control has no switch in the game, so the lamps report what the truck
+is doing instead of what a driver selected. `wheel_slip()` measures the worst
+powered wheel's surface speed against ground speed — the way a real DSC does,
+rather than guessing from the throttle — and anything past 8% slip under power
+flashes the triangle. The in-game date is not a real one, so only the hour and
+minute come from the game; the date comes from the PC.
 
 ### When the game goes quiet
 
@@ -459,14 +668,24 @@ group defaults to *off* in `include/Config.h`. Enable those one at a time.
 | 0x1F6 | 200 ms | turn signals | OK |
 | 0x26E | 200 ms | ignition status | OK |
 | 0x1D0 | 200 ms | coolant temperature (B0 = degC + 48) | OK |
-| 0x349 | 200 ms | fuel level, DLC 5, 160 counts/litre | OK |
+| 0x349 | 200 ms | fuel level, DLC 5, two non-linear senders | OK |
 | 0x19E / 0x0C0 / 0x0D7 | 200 ms | DSC / ABS / airbag counters | OK |
 | 0x1A0 | 100 ms | "Speed K-CAN" — direct speed, **on by default** | OK |
 | 0x0CE | 100 ms | DSC wheel speeds — four signed 16-bit LE, **on by default** | OK |
+| 0x39E | 1 s | time + date — **sets the cluster clock** | OK |
+| 0x592 | event + 200 ms | check-control symbol by id: DTC / DSC / DSC OFF | OK |
 | 0x1D2 | 200 ms | gear display P R N D, D1..D6 | ? |
 | 0x202 / 0x2C0 | 200 ms | dimmer level / LCD illumination | ? |
 | 0x3B0 | 200 ms | reverse gear | ? |
-| 0x366 | 1 s | outside temperature + range | ? |
+| 0x366 | 1 s | outside temperature + range (KOMBI is the DBC sender) | ? |
+
+Received, never transmitted — these are the cluster's own:
+
+| ID | what |
+|---|---|
+| 0x2CA | the outside temperature it measures on pins 4–5, `B0 × 0.5 − 40` °C |
+| 0x2F8 | its clock: `hour, minute, second, day, month<<4, year LE` |
+
 
 ### Four things that will bite you if you change them
 
@@ -541,18 +760,28 @@ src/ClusterCan.{h,cpp}    frame builders + 10 ms TX scheduler
 src/Protocol.{h,cpp}      binary host link + host-timeout watchdog
 src/Demo.{h,cpp}          local sweep when no host is connected
 src/main.cpp              wiring, text console
-E90_Cluster/              standalone ESP32 sketch (same fixes applied)
+E90_Cluster/              standalone ESP32 sketch (older: no clock, symbols
+                          or fuel curve - the Uno build is the current one)
+drive.sh                  one command: fix whatever is broken, then drive
 host/run.py               simulator entry point
-host/run_ets2.py              ETS2 / ATS shared-memory entry point
-host/cluster_sim/ets2.py      scsTelemetryMap_t reader + game -> cluster mapping
-host/cluster_sim/link.py      serial framing, must match src/Protocol.h
-host/cluster_sim/vehicle.py   engine, turbo, gearbox, driveline, chassis
-host/cluster_sim/audio.py     engine synthesis + sample back end
-host/cluster_sim/gauges.py    dials, needles, glow, telltale icons
-host/cluster_sim/gui.py       cluster layout, telemetry rail, keyboard
+host/run_ets2.py          ETS2 / ATS entry point
+host/ambient_resistor.py  temperature <-> resistor for the pins 4-5 NTC
+
+host/cluster_sim/link.py        serial framing, must match src/Protocol.h
+host/cluster_sim/vehicle.py     engine, turbo, gearbox, driveline, chassis
+host/cluster_sim/audio.py       engine synthesis + sample back end
+host/cluster_sim/gauges.py      dials, needles, glow, telltale icons
+host/cluster_sim/gui.py         cluster layout, telemetry rail, keyboard
+host/cluster_sim/ets2.py        scsTelemetryMap_t reader + game -> cluster mapping
+host/cluster_sim/ets2_plugin.py reader for our plugin's block, same mapping
+
+plugin/src/cluster_telemetry.cpp  the ETS2/ATS plugin itself (builds with g++)
+plugin/include/cluster_shm.h      the published block - the C/Python contract
+plugin/test/host_test.cpp         loads the .so and drives it with no game
+plugin/scs_sdk/                   official SCS SDK 1.16 headers, MIT, vendored
 ```
 
-The wire format is `0xAA 0x55 <len=20> <20 bytes> <xor>`, little-endian. The
+The wire format is `0xAA 0x55 <len=28> <28 bytes> <xor>`, little-endian. The
 layout lives in `struct HostState` (`src/Protocol.h`) and `_FMT`
 (`host/cluster_sim/link.py`); a `static_assert` fails the firmware build if
 the struct ever stops matching `cfg::HOST_PAYLOAD`.
@@ -566,7 +795,7 @@ Byte layouts came from these, cross-checked against each other:
 - [bmw-e90.dbc](https://gist.github.com/nberlette/0ed4967da74d626da377e1b1cff70989) — signal definitions, scaling, enums
 - [E90 K-CAN notes](https://gist.github.com/MorGuux/1f93228d5dde65fc7f81d78ddf405f99) — ID to module map
 - [loopybunny — K-CAN](http://www.loopybunny.co.uk/CarPC/k_can.html) — frame rates and IDs from a real bus
-- [veikkos/e90-can-cluster](https://github.com/veikkos/e90-can-cluster) — a working driver for this exact cluster: 0x1A6 accumulator at 13.0 counts/s per km/h, 100 ms cadence, +400 time tick, time-based 0x1A0 alive nibble. Its `e90_m3_dump_veikkos.txt` is the capture analysed above
+- [veikkos/e90-can-cluster](https://github.com/veikkos/e90-can-cluster) — a working driver for this exact cluster: 0x1A6 accumulator at 13.0 counts/s per km/h, 100 ms cadence, +400 time tick, time-based 0x1A0 alive nibble, the 0x39E clock layout, the 0x592 symbol frame and its id list, the two fuel-sender curves, and the pins 4–5 ambient NTC (5 kΩ at 25 °C, β 3950). Its `e90_m3_dump_veikkos.txt` is the capture analysed above
 - [E65 ReverseEngineering — 0x1A0](https://github.com/HeinrichG-V12/E65_ReverseEngineering/blob/main/docs/0x1A0.md) — 0x1A0 bit fields and checksum
 - [truckermudgeon/scs-sdk-plugin](https://github.com/truckermudgeon/scs-sdk-plugin) — the plugin that publishes `scsTelemetryMap_t`; its `scs-telemetry/inc/scs-telemetry-common.hpp` is the layout `host/cluster_sim/ets2.py` mirrors
 - [SCS Software — Telemetry SDK](https://modding.scssoft.com/wiki/SCS_SDK) — channel units and semantics (`gear`, blinker enable vs. lamp)

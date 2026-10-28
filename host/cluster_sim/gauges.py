@@ -398,6 +398,44 @@ def _icon_seat(surf, colour):
     pygame.draw.line(surf, colour, (cx - 9, cy - 1), (cx + 6, cy + 9), 2)
 
 
+def _icon_text(surf, colour, text: str, box: bool = False):
+    """Lettered telltale - DTC, DSC OFF and friends are text on a real cluster."""
+    size = 12 if len(text) <= 3 else 10
+    f = pygame.font.SysFont("consolas,monospace", size, bold=True)
+    img = f.render(text, True, colour)
+    w, h = surf.get_size()
+    surf.blit(img, img.get_rect(center=(w // 2, h // 2)))
+    if box:
+        pygame.draw.rect(surf, colour, pygame.Rect(2, 4, w - 4, h - 8), 1,
+                         border_radius=3)
+
+
+def _icon_dsc_off(surf, colour):
+    """The DSC skid symbol with OFF under it, as the cluster draws it."""
+    w, h = surf.get_size()
+    cx, cy = w // 2, h // 2 - 5
+    pygame.draw.circle(surf, colour, (cx - 1, cy - 2), 5, 2)
+    pygame.draw.arc(surf, colour, pygame.Rect(cx - 11, cy + 1, 10, 7),
+                    math.radians(200), math.radians(340), 2)
+    pygame.draw.arc(surf, colour, pygame.Rect(cx + 2, cy + 1, 10, 7),
+                    math.radians(200), math.radians(340), 2)
+    f = pygame.font.SysFont("consolas,monospace", 10, bold=True)
+    img = f.render("OFF", True, colour)
+    surf.blit(img, img.get_rect(center=(w // 2, h - 6)))
+
+
+def _icon_fuel(surf, colour):
+    """Pump with a nozzle - the reserve warning."""
+    w, h = surf.get_size()
+    cx, cy = w // 2, h // 2
+    body = pygame.Rect(cx - 8, cy - 9, 11, 18)
+    pygame.draw.rect(surf, colour, body, 2, border_radius=2)
+    pygame.draw.line(surf, colour, (cx - 6, cy - 5), (cx + 1, cy - 5), 2)
+    pygame.draw.line(surf, colour, (cx + 3, cy - 4), (cx + 8, cy - 4), 2)
+    pygame.draw.line(surf, colour, (cx + 8, cy - 4), (cx + 8, cy + 6), 2)
+    pygame.draw.circle(surf, colour, (cx + 8, cy + 8), 2)
+
+
 def _icon_glow(surf, colour):
     """Diesel pre-heat coil."""
     w, h = surf.get_size()
@@ -423,6 +461,11 @@ ICONS = {
     "fog_r": lambda s, c: _icon_fog(s, c, True),
     "belt": _icon_seat,
     "glow": _icon_glow,
+    # Check-control symbols on 0x592 rather than telltale bits - see
+    # cfg::sym in include/Config.h.
+    "dtc": lambda s, c: _icon_text(s, c, "DTC", box=True),
+    "dsc_off": _icon_dsc_off,
+    "fuel": _icon_fuel,
 }
 
 

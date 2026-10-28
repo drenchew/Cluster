@@ -1,0 +1,12 @@
+/*
+ * Only the two entry points the game looks up by name leave the library.
+ * Everything else stays internal, so nothing here can collide with a symbol
+ * in the game or in another plugin loaded beside it.
+ */
+{
+    global:
+        scs_telemetry_init;
+        scs_telemetry_shutdown;
+    local:
+        *;
+};

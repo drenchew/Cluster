@@ -3,7 +3,7 @@
 Wire format must stay byte-for-byte identical to ``struct HostState`` in
 ``src/Protocol.h``:
 
-    0xAA 0x55  <len=20>  <20 payload bytes>  <xor over len+payload>
+    0xAA 0x55  <len=28>  <28 payload bytes>  <xor over len+payload>
 
 The firmware owns CAN timing. We only push setpoints; if this process dies the
 Arduino keeps the 0x130 heartbeat running and falls back to its own demo sweep,
@@ -27,16 +27,25 @@ SYNC0 = 0xAA
 SYNC1 = 0x55
 
 # rpm, speed, fuelDl, coolantC, outsideC, rangeKm,
-# flags, lights, turn, gearPos, gearNum, gearMode, dimmer, pedalPct
-_FMT = "<HHHhhHBBBBBBBB"
+# flags, lights, turn, gearPos, gearNum, gearMode, dimmer, pedalPct,
+# flags2, hour, minute, second, day, month, year
+_FMT = "<HHHhhHBBBBBBBBBBBBBBH"
 PAYLOAD_LEN = struct.calcsize(_FMT)
-assert PAYLOAD_LEN == 20, PAYLOAD_LEN
+assert PAYLOAD_LEN == 28, PAYLOAD_LEN
 
 # HostFlags in src/Protocol.h
 HF_KL15 = 0x01
 HF_ENGINE = 0x02
 HF_HANDBRAKE = 0x04
 HF_REVERSE = 0x08
+
+# HostFlags2 in src/Protocol.h. These three drive check-control symbols on
+# 0x592 rather than bits in a telltale frame - the E9x cluster has no "light
+# the DSC lamp" signal, so a numbered symbol is raised and cleared instead.
+HF2_TC_LAMP = 0x01       # "DTC" traction-mode lamp
+HF2_DSC_LAMP = 0x02      # DSC triangle - flashed while actually intervening
+HF2_DSC_OFF = 0x04       # DSC switched off, solid
+HF2_CLOCK = 0x08         # the clock fields are valid
 
 # cfg::LIGHT_* in include/Config.h
 LIGHT_SIDE = 0x01
@@ -73,6 +82,17 @@ class Setpoints:
     dimmer: int = 200
     pedal_pct: int = 0
 
+    # ---- DSC / traction control -------------------------------------------
+    tc_lamp: bool = False      # traction mode (DTC) enabled
+    dsc_lamp: bool = False     # intervening right now; flash this yourself
+    dsc_off: bool = False      # stability control switched off
+
+    # ---- clock -------------------------------------------------------------
+    # None leaves the cluster's clock alone (the firmware keeps running
+    # whatever it last had). A datetime - or anything with the usual
+    # attributes, e.g. time.localtime() wrapped by from_struct_time - sets it.
+    clock: object | None = None
+
     def pack(self) -> bytes:
         flags = (
             (HF_KL15 if self.kl15 else 0)
@@ -80,6 +100,21 @@ class Setpoints:
             | (HF_HANDBRAKE if self.handbrake else 0)
             | (HF_REVERSE if self.reverse else 0)
         )
+        flags2 = (
+            (HF2_TC_LAMP if self.tc_lamp else 0)
+            | (HF2_DSC_LAMP if self.dsc_lamp else 0)
+            | (HF2_DSC_OFF if self.dsc_off else 0)
+        )
+        c = self.clock
+        if c is None:
+            hour = minute = second = 0
+            day = month = 1
+            year = 2000
+        else:
+            flags2 |= HF2_CLOCK
+            hour, minute, second = c.hour, c.minute, c.second
+            day, month, year = c.day, c.month, c.year
+
         turn = (0x01 if self.turn_left else 0) | (0x02 if self.turn_right else 0)
         payload = struct.pack(
             _FMT,
@@ -97,6 +132,13 @@ class Setpoints:
             self.gear_mode & 0xFF,
             _clamp(self.dimmer, 0, 255),
             _clamp(self.pedal_pct, 0, 100),
+            flags2,
+            _clamp(hour, 0, 23),
+            _clamp(minute, 0, 59),
+            _clamp(second, 0, 59),
+            _clamp(day, 1, 31),
+            _clamp(month, 1, 12),
+            _clamp(year, 2000, 2200),
         )
         checksum = PAYLOAD_LEN
         for b in payload:
@@ -106,6 +148,30 @@ class Setpoints:
 
 def _clamp(v, lo, hi) -> int:
     return int(max(lo, min(hi, round(v))))
+
+
+@dataclass
+class Clock:
+    """The fields ``Setpoints.clock`` needs, from whatever source.
+
+    ``datetime.datetime`` already has these attributes, so the sim just passes
+    one; this exists for the game clock, which is a count of in-game minutes
+    and has no datetime to offer.
+    """
+
+    hour: int = 0
+    minute: int = 0
+    second: int = 0
+    day: int = 1
+    month: int = 1
+    year: int = 2000
+
+    @classmethod
+    def from_struct_time(cls, t) -> "Clock":
+        return cls(t.tm_hour, t.tm_min, t.tm_sec, t.tm_mday, t.tm_mon, t.tm_year)
+
+    def hhmm(self) -> str:
+        return f"{self.hour:02d}:{self.minute:02d}"
 
 
 def available_ports() -> list[tuple[str, str]]:

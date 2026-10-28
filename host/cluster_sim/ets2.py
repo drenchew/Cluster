@@ -604,6 +604,21 @@ class MockSource:
         f.truck_b.lightsParking = True
         f.truck_b.lightsBeamLow = True
         f.truck_b.blinkerLeftActive = 18.0 <= t < 26.0
+
+        # Enough wheel data for wheel_slip() to work on, with a deliberate
+        # slip while pulling away so the DSC lamp has something to do.
+        f.config_ui.truckWheelCount = 6
+        spin = 1.35 if 6.5 < t < 9.0 else 1.0
+        for i in range(6):
+            f.config_f.truckWheelRadius[i] = 0.5
+            f.config_b.truckWheelPowered[i] = i in (2, 3)
+            rot = speed / 0.5
+            f.truck_f.truck_wheelVelocity[i] = rot * (spin if i in (2, 3) else 1.0)
+        f.truck_b.differentialLock = 10.0 <= t < 13.0
+
+        # Game clock: start at 06:00 and run an in-game minute a second, which
+        # is roughly the game's own rate.
+        f.common_ui.time_abs = 6 * 60 + int(time.monotonic() - self._t0)
         return f
 
 
@@ -856,6 +871,15 @@ def _open_mapping(name: str):
 # Mapping game -> cluster
 # ---------------------------------------------------------------------------
 
+# ---- traction control -----------------------------------------------------
+# The game publishes each wheel's angular velocity and radius, so the slip of
+# the driven wheels can be measured the way a real DSC does rather than
+# guessed from the throttle: surface speed against ground speed.
+TC_SLIP_ON = 0.08          # fraction of slip that counts as an intervention
+TC_SLIP_FULL = 0.35        # and where it is unambiguous
+TC_MIN_THROTTLE = 0.05     # a locked wheel under braking is not wheelspin
+
+
 @dataclass
 class MapOptions:
     """How much of the truck to squeeze onto a car cluster."""
@@ -864,6 +888,54 @@ class MapOptions:
     speed_scale: float = 1.0
     tank_l: float = 60.0       # car-tank size the fuel gauge is calibrated for
     lights_on: bool = False    # force side + low beam regardless of the game
+    # "game" puts the in-game clock on the cluster (what you want while
+    # driving a 03:00 delivery), "system" the PC's, "off" leaves the cluster's
+    # own clock running.
+    clock: str = "game"
+
+
+def wheel_slip(f: ScsTelemetry) -> float:
+    """Worst driven-wheel slip, 0 = hooked up.
+
+    Surface speed of a powered wheel against the truck's ground speed. The
+    denominator is floored so a launch from rest - where the ground speed is
+    near zero and any wheel rotation is infinite slip - gives a usable number
+    instead of exploding.
+
+    ``truck.wheel.angular_velocity`` is in *rotations per second*, not
+    radians - the SDK header says so and the game agrees: a free-rolling
+    0.506 m wheel at 91.6 km/h reports 8.005, and 25.44 / (2*pi * 0.506) is
+    8.00. So one turn of the wheel covers its circumference, 2*pi*r, and the
+    2*pi here is not optional. Leaving it out scales surface speed to 16% of
+    the truth, which makes slip permanently negative, which clamps to zero -
+    the lamp simply never lights, with nothing to show you why.
+    """
+    speed = abs(_num(f.truck_f.speed))
+    count = int(f.config_ui.truckWheelCount or 0)
+    worst = 0.0
+    for i in range(min(16, count if count > 0 else 16)):
+        if not f.config_b.truckWheelPowered[i]:
+            continue
+        radius = _num(f.config_f.truckWheelRadius[i])
+        if radius <= 0.05:
+            continue
+        rev_per_s = abs(_num(f.truck_f.truck_wheelVelocity[i]))
+        surface = rev_per_s * 2.0 * math.pi * radius
+        worst = max(worst, (surface - speed) / max(speed, 2.0))
+    return max(0.0, worst)
+
+
+def game_clock(f: ScsTelemetry) -> lk.Clock:
+    """The in-game time of day, with today's date for the fields it lacks.
+
+    ``common_ui.time_abs`` is minutes on the game's own calendar, which does
+    not line up with any real year - so the hour and minute come from the game
+    and the date from the host. The cluster shows a clock, not a calendar.
+    """
+    minutes = int(f.common_ui.time_abs) % (24 * 60)
+    now = time.localtime()
+    return lk.Clock(hour=minutes // 60, minute=minutes % 60, second=0,
+                    day=now.tm_mday, month=now.tm_mon, year=now.tm_year)
 
 
 def _num(x, default: float = 0.0) -> float:
@@ -927,7 +999,22 @@ def to_setpoints(f: ScsTelemetry, opt: MapOptions | None = None) -> lk.Setpoints
         lights |= lk.LIGHT_HIGH
     sp.lights = lights
 
-    sp.pedal_pct = int(round(max(0.0, min(1.0, _num(f.truck_f.gameThrottle))) * 100))
+    throttle = max(0.0, min(1.0, _num(f.truck_f.gameThrottle)))
+    sp.pedal_pct = int(round(throttle * 100))
+
+    # Traction control. The game has no DSC switch, so the lamps say what the
+    # truck is doing: the DSC triangle for wheels that are actually slipping
+    # under power (the caller flashes it, as a real intervention flashes), and
+    # the DTC lamp for the inter-axle diff lock, which is the game's own
+    # traction aid being engaged.
+    slip = wheel_slip(f)
+    sp.dsc_lamp = slip > TC_SLIP_ON and throttle > TC_MIN_THROTTLE
+    sp.tc_lamp = bool(f.truck_b.differentialLock)
+
+    if opt.clock == "game":
+        sp.clock = game_clock(f)
+    elif opt.clock == "system":
+        sp.clock = lk.Clock.from_struct_time(time.localtime())
     return sp
 
 
@@ -952,6 +1039,18 @@ def selftest() -> None:
     f.truck_b.engineEnabled = True
     f.truck_b.lightsBeamLow = True
     f.truck_b.blinkerRightActive = True
+    f.common_ui.time_abs = 7 * 60 + 42          # 07:42 in game
+    f.config_ui.truckWheelCount = 6
+    for i in range(6):
+        f.config_f.truckWheelRadius[i] = 0.5
+        f.config_b.truckWheelPowered[i] = i in (2, 3)
+    # Driven wheels turning 25% faster than the road. The channel is
+    # rotations per second, so a 0.5 m wheel covers 2*pi*0.5 = 3.1416 m per
+    # turn and 25 m/s needs 7.9577 rev/s; a quarter over that is 9.9472.
+    free = 25.0 / (2.0 * math.pi * 0.5)
+    for i in range(6):
+        f.truck_f.truck_wheelVelocity[i] = (free * 1.25) if i in (2, 3) else free
+    f.truck_f.gameThrottle = 0.8
 
     raw = ctypes.string_at(ctypes.byref(f), ctypes.sizeof(f))
     back = ScsTelemetry.from_buffer_copy(raw)
@@ -959,6 +1058,8 @@ def selftest() -> None:
     assert abs(back.truck_f.speed - 25.0) < 1e-6
     assert back.truck_b.engineEnabled and back.truck_b.blinkerRightActive
     assert back.truck_i.gear == 6
+
+    assert abs(wheel_slip(back) - 0.25) < 0.01, wheel_slip(back)
 
     sp = to_setpoints(back)
     assert sp.speed_kmh == 90, sp.speed_kmh
@@ -970,9 +1071,19 @@ def selftest() -> None:
     assert sp.lights & lk.LIGHT_LOW
     assert len(sp.pack()) == lk.PAYLOAD_LEN + 4   # 2 sync + len + checksum
 
+    # Slipping driven wheels under power light the intervention lamp; the game
+    # clock reaches the cluster as 07:42.
+    assert sp.dsc_lamp and not sp.tc_lamp
+    assert (sp.clock.hour, sp.clock.minute) == (7, 42), sp.clock
+    assert to_setpoints(back, MapOptions(clock="off")).clock is None
+
+    lifted = ScsTelemetry.from_buffer_copy(raw)
+    lifted.truck_f.gameThrottle = 0.0
+    assert not to_setpoints(lifted).dsc_lamp     # coasting is not wheelspin
+
     rev = ScsTelemetry()
     rev.truck_i.gear = -1
     assert to_setpoints(rev).gear_pos == lk.GEAR_R
     assert to_setpoints(rev).reverse
 
-    print("ets2 selftest OK  (layout, roundtrip, mapping)")
+    print("ets2 selftest OK  (layout, roundtrip, mapping, slip, clock)")

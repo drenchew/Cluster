@@ -83,6 +83,41 @@ void ClusterCan::setOdoMode(uint8_t m) {
 
 void ClusterCan::setSpeedSources(uint8_t m) { speedSrc_ = m & 0x03; }
 
+void ClusterCan::setTractionLamps(bool tcLamp, bool dscLamp, bool dscOff) {
+  sym_[SYM_DTC].want     = tcLamp;
+  sym_[SYM_DSC].want     = dscLamp;
+  sym_[SYM_DSC_OFF].want = dscOff;
+}
+
+/* One spare symbol slot for anything else off the E92 check-control list.
+ * Changing the id while the old symbol is showing has to clear the old one
+ * first, or it stays on the display with nothing left to turn it off. */
+void ClusterCan::setSymbol(uint16_t id, bool on) {
+  SymSlot &sl = sym_[SYM_EXTRA];
+  if (sl.id != id) {
+    if (sl.sent) send592(sl.id, false);
+    sl.id   = id;
+    sl.sent = false;
+  }
+  sl.want = on;
+}
+
+void ClusterCan::setClock(uint8_t hour, uint8_t minute, uint8_t second,
+                          uint8_t day, uint8_t month, uint16_t year) {
+  bool changed = (hour != hour_) || (minute != min_) || (second != sec_)
+              || (day != day_) || (month != month_) || (year != year_);
+  hour_  = hour  % 24;
+  min_   = minute % 60;
+  sec_   = second % 60;
+  day_   = (day   == 0 || day   > 31) ? 1 : day;
+  month_ = (month == 0 || month > 12) ? 1 : month;
+  year_  = year;
+  clockValid_ = true;
+  // The host is the time master: resynchronise the local second tick to its
+  // update so the two never drift a second apart and fight over the display.
+  if (changed) lastSecMs_ = millis();
+}
+
 void ClusterCan::setTurn(bool left, bool right) {
   turn_ = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0));
 }
@@ -101,6 +136,85 @@ void ClusterCan::setEngineRunning(bool running) {
 
 void ClusterCan::setTerminal15(bool on) { kl15_ = on; }
 
+static uint8_t daysInMonth(uint8_t month, uint16_t year) {
+  static const uint8_t len[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month < 1 || month > 12) return 31;
+  if (month == 2 && (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0))
+    return 29;
+  return len[month - 1];
+}
+
+/* Advances the local clock off millis(). The host resynchronises it once a
+ * second, but the clock has to keep running on its own: pull the USB cable and
+ * the cluster must not freeze at the time the host died, and the demo sweep has
+ * no clock of its own to offer. */
+void ClusterCan::tickClock(uint32_t now) {
+  if (lastSecMs_ == 0) { lastSecMs_ = now; return; }
+  while ((uint32_t)(now - lastSecMs_) >= 1000) {
+    lastSecMs_ += 1000;
+    if (++sec_ < 60) continue;
+    sec_ = 0;
+    if (++min_ < 60) continue;
+    min_ = 0;
+    if (++hour_ < 24) continue;
+    hour_ = 0;
+    if (++day_ <= daysInMonth(month_, year_)) continue;
+    day_ = 1;
+    if (++month_ <= 12) continue;
+    month_ = 1;
+    year_ = year_ + 1;
+  }
+}
+
+/* Fuel tables: counts per sender at a given fill fraction, in permille so the
+ * interpolation stays in integers. See cfg::FUEL_CURVE_REAL for where these
+ * numbers come from and why a flat litres*160 is wrong. */
+static const uint16_t kFuelFrac[6]  PROGMEM = {1000, 875, 750, 500, 250,   0};
+static const uint16_t kFuelLeft[6]  PROGMEM = {9700, 8200, 6250, 3600, 1950, 625};
+static const uint16_t kFuelRight[6] PROGMEM = {8400, 5400, 4600, 3350, 2200, 950};
+
+uint16_t ClusterCan::fuelCounts(float frac, bool right) const {
+  if (frac < 0.0f) frac = 0.0f;
+  if (frac > 1.0f) frac = 1.0f;
+  if (!cfg::FUEL_CURVE_REAL)
+    return (uint16_t)(frac * cfg::FUEL_TANK_L * cfg::FUEL_PER_LITRE);
+
+  uint16_t pm = (uint16_t)(frac * 1000.0f + 0.5f);
+  const uint16_t *tab = right ? kFuelRight : kFuelLeft;
+  for (uint8_t i = 0; i < 5; i++) {
+    uint16_t hiFrac = pgm_read_word(&kFuelFrac[i]);
+    uint16_t loFrac = pgm_read_word(&kFuelFrac[i + 1]);
+    if (pm > hiFrac || pm < loFrac) continue;
+    uint16_t hiCnt = pgm_read_word(&tab[i]);
+    uint16_t loCnt = pgm_read_word(&tab[i + 1]);
+    uint16_t span  = hiFrac - loFrac;
+    if (span == 0) return loCnt;
+    return (uint16_t)(loCnt + (uint32_t)(hiCnt - loCnt) * (pm - loFrac) / span);
+  }
+  return pgm_read_word(&tab[5]);
+}
+
+/* The level on the bus follows the setpoint at a tank's pace rather than
+ * jumping. One keypress on the host moves the setpoint 5 litres at once and
+ * the console's 'f' command can move it the whole tank; a real sender cannot
+ * do that, and a step that size reads to the cluster as a refuelling event. */
+void ClusterCan::slewFuel(uint32_t now) {
+  float target = (float)fuelDl_ / 10.0f;
+  if (!cfg::FUEL_SLEW || fuelShown_ < 0.0f) {
+    fuelShown_  = target;
+    lastFuelMs_ = now;
+    return;
+  }
+  uint32_t dt = now - lastFuelMs_;
+  if (dt < 50) return;                      // float work at most 20x a second
+  lastFuelMs_ = now;
+  float step = cfg::FUEL_SLEW_FRAC_PER_S * cfg::FUEL_TANK_L * ((float)dt / 1000.0f);
+  float diff = target - fuelShown_;
+  if (diff > step)       fuelShown_ += step;
+  else if (diff < -step) fuelShown_ -= step;
+  else                   fuelShown_ = target;
+}
+
 // ============================================================================
 //  Scheduler: 10 ms tick. 0x0AA goes out on every even tick (20 ms); 0x1A6 on
 //  slots 7 and 17 (100 ms - see cfg::TICK_1A6_STEP: the cluster differentiates
@@ -114,6 +228,9 @@ void ClusterCan::update() {
   if (now - lastTick_ < cfg::TX_TICK_MS) return;
   lastTick_ = now;
   tick_++;
+
+  tickClock(now);
+  if (cfg::SEND_FUEL) slewFuel(now);
 
   if ((tick_ & 1) == 0) send0AA();               // every 20 ms, direct value
 
@@ -149,12 +266,51 @@ void ClusterCan::update() {
     send34F();
   }
   if (cfg::SEND_RANGE && (tick_ % 100) == 6) send366();  // 1 s
+
+  // Check-control symbols: one frame per 100 ms slot, so a burst of lamp
+  // changes spreads out over a few slots instead of flooding one tick.
+  if (cfg::SEND_SYMBOLS && (tick_ % 10) == 5) pumpSymbols();
+
+  // The clock, once anything has told us what time it is. Slots 3 and 13 carry
+  // one short frame each, so this never makes a tick carry a third.
+  if (cfg::SEND_CLOCK && clockValid_ && (tick_ % 10) == 3
+      && (uint32_t)(now - lastClock_) >= cfg::CLOCK_PERIOD_MS) {
+    lastClock_ = now;
+    send39E();
+  }
   drainRx();
 }
 
+/* The cluster is not just a display - it talks back, and two of the frames it
+ * broadcasts answer the questions a bench rig keeps asking:
+ *
+ *   0x2CA  the outside temperature it measures, B0 * 0.5 - 40 degC. This is
+ *          read from a resistive sensor across KOMBI pins 4 and 5, NOT from
+ *          the bus; with nothing wired there it pegs at the bottom of the
+ *          scale, which is the famous "-40" on the on-board computer.
+ *   0x2F8  its clock. Send 0x39E and this is how you see whether it took.
+ *
+ * Both are the cluster's own transmissions, so the jig only listens - see the
+ * warning in Config.h about never transmitting them. */
 void ClusterCan::drainRx() {
   can_frame f;
-  while (mcp_.readMessage(&f) == MCP2515::ERROR_OK) rx_ = rx_ + 1;
+  while (mcp_.readMessage(&f) == MCP2515::ERROR_OK) {
+    rx_ = rx_ + 1;
+    if (!cfg::REPORT_CLUSTER_RX) continue;
+    if (f.can_id == 0x2CA && f.can_dlc >= 1) {
+      // raw/2 - 40 degC, kept in tenths: AVR printf has no %f.
+      kombiTempRaw_   = f.data[0];
+      kombiTempDeciC_ = (int16_t)f.data[0] * 5 - 400;
+      kombiTempSeen_  = true;
+      kombiTempMs_    = millis();
+    } else if (f.can_id == 0x2F8 && f.can_dlc >= 3) {
+      kombiH_ = f.data[0];
+      kombiM_ = f.data[1];
+      kombiS_ = f.data[2];
+      kombiClockSeen_ = true;
+      kombiClockMs_   = millis();
+    }
+  }
 }
 
 bool ClusterCan::send(uint32_t id, const uint8_t *data, uint8_t len) {
@@ -410,16 +566,86 @@ void ClusterCan::send0D7() {
   send(0x0D7, d, 2);
 }
 
-/* 0x349 fuel level: litres*160 (16-bit LE) twice (two tank halves), B4 = 0.
+/* 0x349  Fuel level, 5 bytes  -> FUEL GAUGE + low-fuel check control
+ *   B0..B1 left sender counts, 16-bit LE    B2..B3 right sender counts
+ *   B4 0x00
+ *
  * DLC is 5, not 8 - that is the real frame length (the DBC gives 0x349 five
  * bytes: two 16-bit sensors at 0.00165108 gal/count, i.e. exactly 160
  * counts/litre). Sending DLC 8 makes the cluster discard the frame, so the
- * gauge stays dead and the low-fuel check-control warning keeps chiming. */
+ * gauge stays dead and the low-fuel check-control warning keeps chiming.
+ *
+ * The two senders sit in the two halves of a saddle tank and do NOT share a
+ * curve - see cfg::FUEL_CURVE_REAL. The level sent here is the slewed one, so
+ * the gauge moves like a tank rather than teleporting when the host jumps. */
 void ClusterCan::send349() {
-  uint16_t raw = (uint16_t)(fuelDl_ / 10.0f * 160.0f);
-  uint8_t d[5] = {(uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8),
-                  (uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8), 0x00};
+  float litres = (fuelShown_ >= 0.0f) ? fuelShown_ : (float)fuelDl_ / 10.0f;
+  float frac   = litres / cfg::FUEL_TANK_L;
+  uint16_t l = fuelCounts(frac, false);
+  uint16_t r = fuelCounts(frac, true);
+  uint8_t d[5] = {(uint8_t)(l & 0xFF), (uint8_t)(l >> 8),
+                  (uint8_t)(r & 0xFF), (uint8_t)(r >> 8), 0x00};
   send(0x349, d, 5);
+}
+
+/* 0x39E  Time and date, 8 bytes, 1 s  -> LCD CLOCK
+ *   B0 hour  B1 minute  B2 second  B3 day
+ *   B4 (month << 4) | 0x0F     B5..B6 year, 16-bit LE     B7 0xF2
+ *
+ * This is the frame that sets an E9x KOMBI's clock; the layout is the working
+ * veikkos/e90-can-cluster one. A cluster that has never received it shows no
+ * time at all, which on a bench is always the explanation for a blank clock -
+ * there is no CAS, no iDrive and no GPS on the bench to have ever set it.
+ * The cluster then broadcasts what it believes on 0x2F8, which drainRx()
+ * reads back. */
+void ClusterCan::send39E() {
+  uint8_t d[8] = {hour_, min_, sec_, day_,
+                  (uint8_t)((month_ << 4) | 0x0F),
+                  (uint8_t)(year_ & 0xFF), (uint8_t)(year_ >> 8), 0xF2};
+  send(0x39E, d, 8);
+}
+
+/* 0x592  Check-control symbol, 8 bytes, event driven
+ *   B0 0x40   B1..B2 symbol id, 16-bit LE   B3 0x31 show / 0x30 clear
+ *   B4..B7 0xFF
+ *
+ * There is no "DSC lamp" signal on the K-CAN: the telltales that are not tied
+ * to a frame of their own are numbered check-control symbols, and this is how
+ * you raise and clear them. Ids live in cfg::sym. */
+void ClusterCan::send592(uint16_t id, bool on) {
+  uint8_t d[8] = {0x40, (uint8_t)(id & 0xFF), (uint8_t)(id >> 8),
+                  (uint8_t)(on ? 0x31 : 0x30), 0xFF, 0xFF, 0xFF, 0xFF};
+  send(0x592, d, 8);
+}
+
+/* Sends at most one 0x592 per call: whatever changed first, otherwise the
+ * slot that is most overdue a refresh. A showing symbol is repeated every
+ * cfg::SYM_ON_REFRESH_MS because that is what the real DSC does and because a
+ * single frame lost to a bus error must not leave a lamp wrong; a cleared one
+ * is re-cleared slowly for the same reason. The cursor walks round the slots
+ * so one permanently-changing lamp cannot starve the others. */
+void ClusterCan::pumpSymbols() {
+  uint32_t now = millis();
+  for (uint8_t pass = 0; pass < 2; pass++) {
+    for (uint8_t i = 0; i < SYM_COUNT; i++) {
+      SymSlot &sl = sym_[(symCursor_ + i) % SYM_COUNT];
+      if (sl.id == 0) continue;
+      bool due;
+      if (pass == 0) {
+        due = (sl.want != sl.sent);         // a change: always first
+      } else {
+        uint16_t period = sl.want ? cfg::SYM_ON_REFRESH_MS
+                                  : cfg::SYM_OFF_REFRESH_MS;
+        due = (uint32_t)(now - sl.lastMs) >= period;
+      }
+      if (!due) continue;
+      send592(sl.id, sl.want);
+      sl.sent   = sl.want;
+      sl.lastMs = now;
+      symCursor_ = (uint8_t)((symCursor_ + i + 1) % SYM_COUNT);
+      return;
+    }
+  }
 }
 
 /* 0x21A  FRM lighting status, 3 bytes, 100 ms  -> BACKLIGHT + light telltales

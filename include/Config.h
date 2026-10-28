@@ -65,6 +65,17 @@ constexpr bool SEND_LCD_LIGHT        = false;  // [?]  0x2C0 LCD illumination
 constexpr bool SEND_GEAR             = false;  // [?]  0x1D2 gear display P/R/N/D
 constexpr bool SEND_REVERSE          = false;  // [?]  0x3B0 reverse gear
 constexpr bool SEND_RANGE            = false;  // [?]  0x366 outside temp + range
+constexpr bool SEND_CLOCK            = true;   // [OK] 0x39E time + date -> LCD clock
+constexpr bool SEND_SYMBOLS          = true;   // [OK] 0x592 check-control symbols
+
+// NEVER transmit 0x2CA (outside temperature) or 0x2F8 (time/date): on an E9x
+// the KOMBI is the *sender* of both. Two nodes putting different data behind
+// the same identifier collide bit-for-bit and generate CAN error frames, which
+// is a far worse problem than a wrong reading. The jig listens to them instead
+// (see REPORT_CLUSTER_RX) - they are the cluster telling you what it currently
+// shows, which is exactly what you want while chasing the "-40" ambient
+// reading or an unset clock. 0x366 has KOMBI as its sender in the DBC too,
+// hence the default-off above.
 
 // ---- 0x130 terminal status -------------------------------------------------
 // Byte 4 of 0x130 is a *packed* field: high nibble = rolling counter,
@@ -210,6 +221,90 @@ constexpr float SPEED_0CE_PER_COUNT = 0.636f;
 // cluster reads it as a direct value - faster cadence is tolerated there.)
 // 0x1A6 goes out on scheduler slots 7 and 17 of the 200 ms / 20 tick cycle.
 
+// ---- 0x349 fuel level: two senders, neither of them linear -----------------
+// The E9x tank is a saddle tank with a sender in each half, and 0x349 carries
+// both as 16-bit counts. The flat "litres * 160" the jig used to send is only
+// right for the left sender near full - the gauge is deliberately non-linear
+// (slow to fall off full, quick through the bottom third), and the two senders
+// do not even share a curve. These are the breakpoints from the working
+// veikkos/e90-can-cluster driver, as counts at a given fill fraction:
+//
+//     fill    1.000  0.875  0.750  0.500  0.250  0.000
+//     left     9700   8200   6250   3600   1950    625
+//     right    8400   5400   4600   3350   2200    950
+//
+// Interpolating these makes the needle sit where a real tank's would. Set
+// FUEL_CURVE_REAL = false to go back to the flat 160 counts/litre if you want
+// to compare the two on the bench.
+constexpr bool  FUEL_CURVE_REAL = true;
+constexpr float FUEL_TANK_L     = 60.0f;   // tank the curve above is scaled to
+constexpr float FUEL_PER_LITRE  = 160.0f;  // flat fallback, DBC counts/litre
+
+// A real gauge is heavily damped: the level you see is a long average, and the
+// cluster treats a step change as a refuelling event. The host can jump the
+// level by 40 litres in one frame (one keypress), so the firmware slews it
+// instead - 1.5 %/s is about what a real tank reads back when you fill it.
+constexpr float FUEL_SLEW_FRAC_PER_S = 0.015f;
+constexpr bool  FUEL_SLEW = true;
+
+// ---- 0x39E time / date (sets the cluster clock) ----------------------------
+// Verified against the veikkos/e90-can-cluster driver, which is the one
+// open-source implementation known to set an E9x KOMBI clock:
+//   B0 hour  B1 minute  B2 second  B3 day
+//   B4 (month << 4) | 0x0F        B5..B6 year, 16-bit little-endian
+//   B7 0xF2
+// The cluster echoes what it ends up believing on 0x2F8, so you can read your
+// own frame back (REPORT_CLUSTER_RX) rather than squinting at the LCD.
+//
+// A cluster that has never been given the time shows no clock at all, which is
+// what "no clock on the computer" on a bench jig always is: nothing on the bus
+// ever told it what time it is. One frame per second is plenty.
+constexpr uint32_t CLOCK_PERIOD_MS = 1000;
+// Boot time, used until the host sends its own. 12:00 on 2026-01-01 is a
+// deliberately obvious placeholder - if you see it, the host link is not
+// supplying a clock.
+constexpr uint8_t  CLOCK_BOOT_HOUR  = 12;
+constexpr uint8_t  CLOCK_BOOT_MIN   = 0;
+constexpr uint8_t  CLOCK_BOOT_DAY   = 1;
+constexpr uint8_t  CLOCK_BOOT_MONTH = 1;
+constexpr uint16_t CLOCK_BOOT_YEAR  = 2026;
+
+// ---- 0x592 check-control symbols ------------------------------------------
+// The E9x KOMBI does not have a "light the DSC lamp" signal. Telltales that
+// are not hard-wired to a frame of their own are check-control *symbols*,
+// addressed by number on 0x592:
+//
+//   B0 0x40   B1..B2 symbol id, 16-bit little-endian
+//   B3 0x31 = show, 0x30 = clear   B4..B7 0xFF
+//
+// Symbol ids are from the E92 check-control symbol list (see the veikkos
+// driver's external/ folder). Only a handful matter here; the full list has
+// several hundred, and a cluster silently ignores an id it does not know.
+namespace sym {
+constexpr uint16_t DTC          = 357;  // "DTC" - traction mode / TC enabled
+constexpr uint16_t DSC_TRIANGLE = 215;  // DSC triangle alone - intervention
+constexpr uint16_t DSC_OFF      = 36;   // DSC triangle + double warning = off
+constexpr uint16_t SERVICE      = 281;  // service due - suppressed at boot
+}  // namespace sym
+
+// An ON symbol is refreshed periodically (the real DSC repeats its symbols at
+// 50-200 ms); an OFF one only needs an occasional re-clear so a frame lost to
+// a bus error does not leave a lamp stuck on.
+constexpr uint16_t SYM_ON_REFRESH_MS  = 200;
+constexpr uint16_t SYM_OFF_REFRESH_MS = 3000;
+// The jig has no service-interval data, and a cluster fresh off a scrapyard
+// car usually boots with the service message up. Clear it once at startup.
+constexpr bool SUPPRESS_SERVICE_LIGHT = true;
+
+// ---- Listening to the cluster ---------------------------------------------
+// The KOMBI broadcasts what it currently believes: 0x2CA = the outside
+// temperature it measures on its own sensor pins (B0 * 0.5 - 40 degC) and
+// 0x2F8 = its clock. Printing them every few seconds turns two of the most
+// annoying bench questions - "what does the thermometer actually read?" and
+// "did the clock take?" - into a line in the log pane.
+constexpr bool     REPORT_CLUSTER_RX = true;
+constexpr uint32_t REPORT_PERIOD_MS  = 5000;
+
 // ---- Host link (PC simulator over USB serial) ------------------------------
 // The firmware always owns CAN timing. The host only supplies setpoints; if
 // it goes quiet the heartbeat keeps running and the jig falls back to the
@@ -217,7 +312,7 @@ constexpr float SPEED_0CE_PER_COUNT = 0.636f;
 constexpr uint32_t HOST_TIMEOUT_MS = 1500;
 constexpr uint8_t  HOST_SYNC0      = 0xAA;
 constexpr uint8_t  HOST_SYNC1      = 0x55;
-constexpr uint8_t  HOST_PAYLOAD    = 20;   // sizeof(HostState) - keep in sync
+constexpr uint8_t  HOST_PAYLOAD    = 28;   // sizeof(HostState) - keep in sync
 
 // ---- Demo sweep ------------------------------------------------------------
 // Runs only while no host is connected. Bottoms out at idle, never at 0 rpm.

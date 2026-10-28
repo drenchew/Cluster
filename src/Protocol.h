@@ -2,8 +2,8 @@
 /*
  * Protocol - binary setpoint link from the PC simulator.
  *
- * Wire format, little-endian, 24 bytes total:
- *     0xAA 0x55  <len=20>  <20 payload bytes>  <xor>
+ * Wire format, little-endian, 32 bytes total:
+ *     0xAA 0x55  <len=28>  <28 payload bytes>  <xor>
  * where xor covers the length byte and the payload.
  *
  * Design rule: the host NEVER drives CAN timing. It only pushes setpoints
@@ -37,7 +37,14 @@ struct __attribute__((packed)) HostState {
   uint8_t  gearMode;    // GearMode enum: 0 normal, 1 sport, 2 manual
   uint8_t  dimmer;      // 0..255 instrument illumination
   uint8_t  pedalPct;    // accelerator 0..100 -> 0x0AA pedal bytes
-};                      // = 20 bytes, matches cfg::HOST_PAYLOAD
+  uint8_t  flags2;      // see HF2_* below
+  uint8_t  hour;        // clock, local time, 0..23
+  uint8_t  minute;      // 0..59
+  uint8_t  second;      // 0..59
+  uint8_t  day;         // 1..31
+  uint8_t  month;       // 1..12
+  uint16_t year;        // full year, e.g. 2026
+};                      // = 28 bytes, matches cfg::HOST_PAYLOAD
 
 static_assert(sizeof(HostState) == cfg::HOST_PAYLOAD,
               "HostState size must equal cfg::HOST_PAYLOAD and host/link.py _FMT");
@@ -47,6 +54,17 @@ enum HostFlags : uint8_t {
   HF_ENGINE    = 0x02,  // engine running (vs key-on-engine-off)
   HF_HANDBRAKE = 0x04,
   HF_REVERSE   = 0x08,
+};
+
+/* The traction lamps are check-control symbols on 0x592, not bits in a
+ * telltale frame, so they are plain on/off requests here. The DSC triangle
+ * flashes in a real intervention; the host does that flashing, because it is
+ * the end that knows an intervention has started. */
+enum HostFlags2 : uint8_t {
+  HF2_TC_LAMP   = 0x01,  // "DTC" traction-mode lamp          (sym::DTC)
+  HF2_DSC_LAMP  = 0x02,  // DSC triangle, intervention        (sym::DSC_TRIANGLE)
+  HF2_DSC_OFF   = 0x04,  // DSC switched off, solid           (sym::DSC_OFF)
+  HF2_CLOCK     = 0x08,  // the clock fields below are valid
 };
 
 class Protocol {

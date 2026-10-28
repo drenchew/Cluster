@@ -14,6 +14,9 @@
  *        h 1     handbrake     e 0|1  engine          k 0|1  terminal 15
  *        o 0|1|2 0x1A6 distance counter: frozen / alive / distance
  *        x 0..3  extra speed frames: +1 = 0x1A0, +2 = 0x0CE
+ *        w 1435  set the clock (HHMM or HHMMSS) - 0x39E
+ *        u 0..7  traction lamps: +1 DTC, +2 DSC triangle, +4 DSC off
+ *        y 357 1 raise/clear any check-control symbol by id (0x592)
  *        d       resume demo sweep    ?      print state
  *
  * The firmware always owns CAN timing. If the host goes quiet the heartbeat
@@ -46,6 +49,9 @@ static void printState() {
   logf("0x1A6: odo mode %u dist 0x%04X | extra speed 0x%02X\n",
        (unsigned)cluster.odoMode(), (unsigned)cluster.odoCounter(),
        (unsigned)cluster.speedSources());
+  logf("clock %02u:%02u:%02u %s\n", (unsigned)cluster.clockHour(),
+       (unsigned)cluster.clockMin(), (unsigned)cluster.clockSec(),
+       cluster.clockValid() ? "(sent on 0x39E)" : "(never set - no 0x39E yet)");
   logf("tx %lu fail %lu rx %lu | host %s frames %lu err %lu\n",
        (unsigned long)s.txOk, (unsigned long)s.txFail, (unsigned long)s.rx,
        host.hostLive() ? "live" : "idle",
@@ -96,6 +102,35 @@ static void runCommand(char c, const char *arg) {
                    (cluster.speedSources() & cfg::SPEED_SRC_1A0) ? "0x1A0 " : "",
                    (cluster.speedSources() & cfg::SPEED_SRC_0CE) ? "0x0CE " : "",
                    cluster.speedSources() ? "" : "none (0x1A6 only)"); break;
+    case 'w': {
+      // HHMM or HHMMSS, so "w 0905" is 09:05 and not nine minutes past five.
+      uint32_t n = (uint32_t)atol(arg);
+      uint8_t h, m, sec = 0;
+      if (n > 9999) { h = n / 10000; m = (n / 100) % 100; sec = n % 100; }
+      else          { h = n / 100;   m = n % 100; }
+      cluster.setClock(h, m, sec, cluster.clockDay(), cluster.clockMonth(),
+                       cluster.clockYear());
+      logf("clock %02u:%02u:%02u\n", (unsigned)cluster.clockHour(),
+           (unsigned)cluster.clockMin(), (unsigned)cluster.clockSec());
+      break;
+    }
+    case 'u': {
+      uint8_t m = (uint8_t)v;
+      cluster.setTractionLamps(m & 0x01, m & 0x02, m & 0x04);
+      logf("traction lamps: DTC %u DSC %u DSC-off %u\n",
+           (unsigned)((m & 0x01) != 0), (unsigned)((m & 0x02) != 0),
+           (unsigned)((m & 0x04) != 0));
+      break;
+    }
+    case 'y': {
+      // "y 357 1" - id first, then 0/1. Anything from the E92 symbol list.
+      char *end = nullptr;
+      uint16_t id = (uint16_t)strtoul(arg, &end, 0);
+      bool on = end && (strtol(end, nullptr, 0) != 0);
+      cluster.setSymbol(id, on);
+      logf("symbol %u %s\n", (unsigned)id, on ? "on" : "off");
+      break;
+    }
     case 'd': demo.resume(); Serial.println(F("demo sweep resumed")); break;
     case '?': printState(); break;
     default: break;
@@ -152,6 +187,9 @@ void setup() {
   }
   cluster.setEngineRunning(cfg::ENGINE_RUNNING_AT_BOOT);
   cluster.setLights(cfg::LIGHT_SIDE | cfg::LIGHT_LOW);   // backlight on at boot
+  // A cluster out of a scrapped car usually boots with the service message
+  // up, and the jig has no service data to justify it.
+  if (cfg::SUPPRESS_SERVICE_LIGHT) cluster.setSymbol(cfg::sym::SERVICE, false);
 
   Serial.println(F("TX running: 0x130/0x1A0/0x1B4 @100ms, 0x1A6 @100ms, 0x0AA @20ms"));
   logf("idle %u rpm, 0x130 B4 0x%02X, odo mode %u, 0x1A0 %s\n",
@@ -171,11 +209,54 @@ void loop() {
   if (live != hostWas_) {
     hostWas_ = live;
     if (live) { demo.stop();   Serial.println(F("host connected")); }
-    else      { demo.resume(); Serial.println(F("host lost - demo sweep")); }
+    else {
+      demo.resume();
+      // Whatever the host last asked for is no longer true of anything. A DSC
+      // lamp left showing because the GUI was closed mid-intervention would
+      // stay showing for as long as the jig is powered.
+      cluster.setTractionLamps(false, false, false);
+      Serial.println(F("host lost - demo sweep"));
+    }
   }
 
   demo.update(cluster);
   cluster.update();                       // paces the CAN frames off millis()
+
+  // What the cluster broadcasts about itself, which is how you tell whether
+  // the clock took and what the thermometer really reads. Printed whether or
+  // not the host is driving, because the host's log pane is where you read it.
+  if (cfg::REPORT_CLUSTER_RX) {
+    static uint32_t lastKombi = 0;
+    if (millis() - lastKombi >= cfg::REPORT_PERIOD_MS) {
+      lastKombi = millis();
+      if (cluster.kombiTempKnown() || cluster.kombiClockKnown()) {
+        Serial.print(F("kombi:"));
+        if (cluster.kombiTempKnown()) {
+          if (!cluster.kombiTempValid()) {
+            // 0xFF: the cluster has no reading at all, which on a bench means
+            // nothing is wired across pins 4 and 5. See host/ambient_resistor.py.
+            Serial.print(F(" outside -- (sensor open on pins 4/5)"));
+          } else {
+            int16_t t = cluster.kombiTempDeciC();
+            Serial.print(F(" outside "));
+            if (t < 0) { Serial.write('-'); t = -t; }
+            printFix1((uint16_t)t);
+            Serial.print(F("C"));
+          }
+        }
+        if (cluster.kombiClockKnown()) {
+          if (!cluster.kombiClockValid()) {
+            Serial.print(F(" clock not set (send 0x39E: 'w 1435')"));
+          } else {
+            uint8_t h, m, sec;
+            cluster.kombiClock(h, m, sec);
+            logf(" clock %02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)sec);
+          }
+        }
+        Serial.println();
+      }
+    }
+  }
 
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 5000) {

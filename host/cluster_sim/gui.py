@@ -14,13 +14,14 @@ so they lag and overshoot the way a stepper-driven needle does.
 from __future__ import annotations
 
 import math
+import time
 
 import pygame
 
 from . import gauges as g
 from . import link as lk
-from .vehicle import (GEAR_RATIOS, LIMITER_RPM, REDLINE_RPM, SEL_D, SEL_N,
-                      SEL_P, SEL_R, Vehicle)
+from .vehicle import (DSC_DTC, DSC_OFF, FUEL_TANK_L, GEAR_RATIOS, LIMITER_RPM,
+                      REDLINE_RPM, SEL_D, SEL_N, SEL_P, SEL_R, Vehicle)
 
 WIDTH, HEIGHT = 1280, 720
 FPS = 60
@@ -32,6 +33,9 @@ FUEL_MAX = 60        # major 30   -> 0 30 60
 # Coolant spans 50..130 like the real gauge, so a normal 90 C sits dead centre
 # instead of three-quarters up an alarming-looking 0..120 scale.
 TEMP_MIN, TEMP_MAX = 50, 130
+
+# The DSC lamp flashes during an intervention, much faster than an indicator.
+DSC_BLINK_S = 0.11
 
 HELP = [
     ("W / Up", "throttle"),
@@ -50,8 +54,12 @@ HELP = [
     ("Z", "hazards"),
     ("L", "lights  off / side / low / high"),
     ("F / V", "front / rear fog"),
+    ("C", "DSC  on / DTC / off"),
     ("[ / ]", "dimmer down / up"),
     ("- / =", "fuel down / up"),
+    ("R", "hold to refuel"),
+    ("X", "fuel drain  real / x25"),
+    ("; / '", "outside temp down / up"),
     (", / .", "gradient down / up"),
     ("T", "reset trip"),
     ("Tab", "show / hide this help"),
@@ -113,6 +121,8 @@ class Dashboard:
         self.bank = g.TelltaleBank()
         self._blink_t = 0.0
         self._blink_on = False
+        self._dsc_t = 0.0
+        self._dsc_on = False
 
     # -- input --------------------------------------------------------------
     def handle_events(self) -> None:
@@ -131,6 +141,7 @@ class Dashboard:
         c.brake = 1.0 if (keys[pygame.K_s] or keys[pygame.K_DOWN]) else 0.0
         c.turn_left = keys[pygame.K_a] or keys[pygame.K_LEFT]
         c.turn_right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
+        c.refuel = keys[pygame.K_r]          # held, like standing at the pump
 
     def _keydown(self, key: int, c) -> None:
         v = self.vehicle
@@ -168,6 +179,14 @@ class Dashboard:
             c.fog_rear = not c.fog_rear
         elif key == pygame.K_p:
             c.sport = not c.sport
+        elif key == pygame.K_c:
+            v.cycle_dsc()
+        elif key == pygame.K_x:
+            c.fuel_fast = not c.fuel_fast
+        elif key == pygame.K_SEMICOLON:
+            v.outside_c = max(-40.0, v.outside_c - 1.0)
+        elif key == pygame.K_QUOTE:
+            v.outside_c = min(50.0, v.outside_c + 1.0)
         elif key == pygame.K_t:
             v.reset_trip()
         elif key == pygame.K_LEFTBRACKET:
@@ -177,7 +196,7 @@ class Dashboard:
         elif key in (pygame.K_MINUS, pygame.K_KP_MINUS):
             v.fuel_l = max(0.0, v.fuel_l - 5.0)
         elif key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
-            v.fuel_l = min(60.0, v.fuel_l + 5.0)
+            v.fuel_l = min(FUEL_TANK_L, v.fuel_l + 5.0)
         elif key == pygame.K_COMMA:
             c.grade_pct = max(-20.0, c.grade_pct - 2.0)
         elif key == pygame.K_PERIOD:
@@ -220,6 +239,16 @@ class Dashboard:
             mode = lk.MODE_SPORT
 
         return lk.Setpoints(
+            # The cluster has no DSC lamp signal: these three raise and clear
+            # check-control symbols on 0x592. The intervention lamp is flashed
+            # from here rather than by the firmware, because this end knows
+            # when an intervention started.
+            tc_lamp=c.dsc_mode == DSC_DTC,
+            dsc_lamp=v.tc_active and self._dsc_on,
+            dsc_off=c.dsc_mode == DSC_OFF,
+            # Nothing on a bench has ever told the cluster the time - no CAS,
+            # no iDrive, no GPS - so it shows no clock until this arrives.
+            clock=lk.Clock.from_struct_time(time.localtime()),
             rpm=int(v.rpm),
             speed_kmh=int(abs(v.speed_kmh)),
             fuel_l=v.fuel_l,
@@ -249,6 +278,11 @@ class Dashboard:
             self._blink_t = 0.0
             self._blink_on = not self._blink_on
 
+        self._dsc_t += dt
+        if self._dsc_t >= DSC_BLINK_S:
+            self._dsc_t = 0.0
+            self._dsc_on = not self._dsc_on
+
         rpm = self.n_rpm.step(v.rpm, dt)
         speed = self.n_speed.step(abs(v.speed_kmh), dt)
         fuel = self.n_fuel.step(v.fuel_l, dt)
@@ -266,9 +300,9 @@ class Dashboard:
         self.fuel.draw(panel, (470, 206), max(0.0, fuel))
         self.temp.draw(panel, (470, 378), max(0.0, temp))
 
-        self._draw_lcd(panel, 350, 460)
+        self._draw_lcd(panel, 320, 452)
         self._draw_telltales(panel)
-        self._draw_telltales_lower(panel, 120, 600)
+        self._draw_telltales_lower(panel, 112, 600)
 
         dim = max(0.35, v.controls.dimmer / 255.0)
         if dim < 0.999:
@@ -289,7 +323,7 @@ class Dashboard:
     def _draw_lcd(self, s, x, y):
         v = self.vehicle
         c = v.controls
-        box = pygame.Rect(x, y, 240, 118)
+        box = pygame.Rect(x, y, 300, 134)
         pygame.draw.rect(s, g.LCD_BG, box, border_radius=6)
         pygame.draw.rect(s, (40, 60, 50), box, 1, border_radius=6)
 
@@ -307,16 +341,25 @@ class Dashboard:
 
         f = self.fonts["lcd"]
         rows = [
-            (f"{v.odo_m / 1000.0:8.1f} km", box.y + 62),
-            (f"trip {v.trip_m / 1000.0:5.1f} km", box.y + 84),
+            (f"{v.odo_m / 1000.0:8.1f} km", box.y + 64),
+            (f"trip {v.trip_m / 1000.0:5.1f} km", box.y + 87),
         ]
         for txt, ry in rows:
             s.blit(f.render(txt, True, g.LCD_FG), (box.x + 12, ry))
 
-        s.blit(f.render(f"{v.outside_c:4.0f} C", True, g.LCD_FG),
-               (box.x + 148, box.y + 14))
+        # Outside temperature in both units: a cluster coded for an imperial
+        # market shows Fahrenheit, and "-40" there is the same -40 C it reads
+        # with nothing wired to its ambient sensor - see the README.
+        f_deg = v.outside_c * 9.0 / 5.0 + 32.0
+        s.blit(f.render(f"{v.outside_c:3.0f}C {f_deg:3.0f}F", True, g.LCD_FG),
+               (box.x + 122, box.y + 14))
+        # The clock the cluster is being given on 0x39E.
+        s.blit(f.render(time.strftime("  %H:%M:%S"), True, g.LCD_FG),
+               (box.x + 122, box.y + 36))
         cons = f"{v.l_per_100km:4.1f}" if v.l_per_100km > 0.1 else " --.-"
-        s.blit(f.render(f"{cons} l", True, g.LCD_FG), (box.x + 148, box.y + 36))
+        rng = f"{v.range_km:4.0f}" if v.fuel_l > 0.05 else "   0"
+        s.blit(f.render(f"{cons} l/100  {rng} km", True, g.LCD_FG),
+               (box.x + 12, box.y + 110))
 
     # -- telltales ----------------------------------------------------------
     def _draw_telltales(self, s):
@@ -343,20 +386,27 @@ class Dashboard:
             ("batt", key_on_engine_off, g.BAD),
             ("oil", key_on_engine_off, g.BAD),
             ("abs", not v.running, g.AMBER),
-            ("dsc", v.wheelspin > 0.05 or not v.running, g.AMBER),
+            # The DSC triangle flashes while the system is actually cutting
+            # fuelling, exactly as the cluster shows it; DTC and DSC-OFF are
+            # steady lamps for the mode itself.
+            ("dsc", (v.tc_active and self._dsc_on) or not v.running, g.AMBER),
+            ("dtc", c.dsc_mode == DSC_DTC, g.AMBER),
+            ("dsc_off", c.dsc_mode == DSC_OFF, g.AMBER),
+            ("fuel", v.low_fuel, g.AMBER),
             ("belt", True, g.BAD),
             ("fog_f", c.fog_front, g.GOOD),
             ("fog_r", c.fog_rear, g.AMBER),
         ]
         for i, (name, on, colour) in enumerate(lamps):
-            self.bank.draw(s, name, (x + i * 76, y), bool(on), colour)
+            self.bank.draw(s, name, (x + i * 68, y), bool(on), colour)
 
     # -- telemetry rail -----------------------------------------------------
     def _draw_rail(self, s, x, y):
         v = self.vehicle
         c = v.controls
         f = self.fonts["small"]
-        rail = pygame.Rect(x - 14, y - 14, WIDTH - x, 520)
+        # Tall enough to enclose the firmware log box at the bottom of it.
+        rail = pygame.Rect(x - 14, y - 14, WIDTH - x, HEIGHT - y - 8)
         pygame.draw.rect(s, (15, 16, 20), rail, border_radius=8)
         pygame.draw.rect(s, (44, 48, 57), rail, 1, border_radius=8)
 
@@ -368,7 +418,9 @@ class Dashboard:
             ("boost", v.boost * 100, 100.0, g.BLUE, f"{v.boost*100:3.0f}%"),
             ("fuelling", v.fuelling * 100, 100.0, g.WARN, f"{v.fuelling*100:3.0f}%"),
             ("slip", v.wheelspin * 100, 100.0, g.BAD, f"{v.wheelspin*100:3.0f}%"),
-            ("fuel", v.fuel_l, 60.0, g.GOOD, f"{v.fuel_l:4.1f}l"),
+            ("DSC cut", v.tc_cut * 100, 100.0, g.AMBER, f"{v.tc_cut*100:3.0f}%"),
+            ("fuel", v.fuel_l, FUEL_TANK_L,
+             g.AMBER if v.low_fuel else g.GOOD, f"{v.fuel_l:4.1f}l"),
             ("coolant", v.coolant_c, 130.0,
              g.GOOD if v.coolant_c < 110 else g.BAD, f"{v.coolant_c:3.0f}C"),
             ("dimmer", c.dimmer, 255.0, g.WARN, f"{c.dimmer:3d}"),
@@ -394,6 +446,14 @@ class Dashboard:
                         f"{' sport' if c.sport else ''}", g.LABEL),
             ("gradient", f"{c.grade_pct:+.0f}%", g.LABEL),
             ("accel", f"{v.accel_ms2:+5.2f} m/s2", g.LABEL),
+            ("DSC", v.dsc_name + (" cutting" if v.tc_active else ""),
+             g.AMBER if (v.tc_active or c.dsc_mode != 0) else g.GOOD),
+            ("fuel burn", ("x25 bench" if c.fuel_fast else "real time")
+                          + (" + pump" if c.refuel else ""),
+             g.WARN if c.fuel_fast else g.LABEL),
+            ("outside", f"{v.outside_c:.0f} C / "
+                        f"{v.outside_c * 9.0 / 5.0 + 32.0:.0f} F", g.LABEL),
+            ("clock", time.strftime("%H:%M:%S  %d.%m.%Y"), g.LABEL),
         ]
         for label, val, colour in rows:
             s.blit(f.render(label, True, g.LABEL), (x, ry))
