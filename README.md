@@ -406,14 +406,27 @@ python3 run_sysmon.py --no-serial -v  # print the readings, touch no hardware
 python3 run_sysmon.py --selftest      # mapping checks
 ```
 
-| dial | quantity | full scale |
+This cluster has four needles, and the mode drives all four:
+
+| needle | quantity | full scale |
 |---|---|---|
 | speedometer | network download rate | `--max-mbit`, default 100 Mbit/s, maps to 260 km/h |
 | tachometer | memory in use | 5500 rpm, the diesel redline |
-| consumption gauge | processor load | 0 to 100 percent demand |
-| fuel gauge | free filesystem space | a full tank is an empty disk |
-| coolant gauge | processor temperature | degrees Celsius, passed through unchanged |
-| clock | the host clock | |
+| consumption | processor load | 0 to 100 percent demand |
+| fuel level | free filesystem space | a full tank is an empty disk |
+
+The clock shows the host's time. Processor temperature is sent as the coolant
+temperature, but **this cluster variant has no coolant needle** — the
+reference driver for the same hardware notes that coolant temperature is
+"visible in debug menu only". It is still worth sending, because the cluster
+expects a plausible engine temperature, and it reaches the driver through the
+overheat telltale and the hidden service menu. Upload rate is measured and
+reported on the console but has no dial left to show it.
+
+If the fourth needle on a particular cluster turns out to be oil temperature
+rather than consumption — the reference notes both variants exist — then
+0x1D0 byte 1 is the one to drive, and it currently carries coolant minus
+twenty degrees.
 
 Telltales light on sustained load: check engine above 90 percent processor,
 tyre pressure above 90 percent memory, and the coolant warning above 85 °C.

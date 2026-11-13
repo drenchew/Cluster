@@ -12,8 +12,11 @@ The dials read:
     tachometer         memory in use          (full scale 5500 rpm)
     consumption gauge  processor load         (0 to 100 percent demand)
     fuel gauge         free filesystem space  (a full tank is an empty disk)
-    coolant gauge      processor temperature  (degrees Celsius, unchanged)
     on-board clock     this machine's clock
+
+Those are the four needles this cluster has. Processor temperature is also
+sent, as the coolant temperature, but this variant has no needle for it: it
+appears as the overheat telltale and in the hidden service menu.
 
 Telltales light for sustained processor load, memory nearly exhausted and a
 hot processor.

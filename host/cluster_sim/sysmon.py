@@ -2,11 +2,16 @@
 
 The cluster becomes a system monitor:
 
-    speedometer       network download rate
-    tachometer        memory in use
-    consumption gauge processor load
-    fuel gauge        free space on the filesystem
-    coolant gauge     processor temperature
+    speedometer        network download rate
+    tachometer         memory in use
+    consumption gauge  processor load
+    fuel gauge         free space on the filesystem
+
+This cluster carries four needles: road speed, engine speed, fuel level and
+instant consumption. There is no coolant temperature needle on this variant;
+the value is still transmitted, because the cluster expects a plausible engine
+temperature, and it drives the overheat telltale and the hidden service menu
+rather than a dial.
 
 Everything is read from ``/proc`` and ``/sys``, so the only dependency is the
 same ``pyserial`` the rest of the host tooling needs.
@@ -327,9 +332,12 @@ class MapOptions:
     # bottom of the dial. Zero allows the warning to act as a low disk alarm.
     fuel_floor_litres: float = 0.0
 
-    # Processor temperature goes to the coolant gauge unchanged, since both are
-    # temperatures in degrees Celsius. A machine with no readable sensor shows
-    # this instead, which keeps the needle off the cold stop.
+    # Processor temperature is reported as the coolant temperature unchanged,
+    # since both are temperatures in degrees Celsius. This variant of the
+    # cluster has no coolant needle, so the value reaches the driver through
+    # the overheat telltale and the hidden service menu; it is still worth
+    # sending, because the cluster expects a plausible engine temperature.
+    # A machine with no readable sensor reports this instead.
     fallback_celsius: int = 60
 
     # Telltales. Each is a fraction of full scale except the temperature.
