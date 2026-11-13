@@ -394,6 +394,61 @@ host/samples/rpm_3500.wav
 They get resampled and crossfaded by rpm. Force the choice with
 `--audio samples` or `--audio synth`.
 
+## System monitor mode
+
+The cluster can be driven from the host machine's own vital signs instead of a
+vehicle, which needs no game and no network connection to anything else:
+
+```sh
+cd host
+python3 run_sysmon.py                 # drive the cluster
+python3 run_sysmon.py --no-serial -v  # print the readings, touch no hardware
+python3 run_sysmon.py --selftest      # mapping checks
+```
+
+| dial | quantity | full scale |
+|---|---|---|
+| speedometer | network download rate | `--max-mbit`, default 100 Mbit/s, maps to 260 km/h |
+| tachometer | memory in use | 5500 rpm, the diesel redline |
+| fuel gauge | processor load | a full tank is 100 percent |
+| coolant gauge | processor temperature | degrees Celsius, passed through unchanged |
+| clock | the host clock | |
+
+Telltales light on sustained load: check engine above 90 percent processor,
+fuel reserve above 90 percent memory, and the coolant warning above 85 °C.
+
+Every value comes from `/proc` and `/sys`, so the only dependency is the
+`pyserial` the rest of the host tooling already needs. Memory in use is
+derived from `MemAvailable` rather than `MemFree`, because the kernel counts
+reclaimable page cache as free and `MemFree` alone reports a healthy machine
+as nearly full. The processor temperature sensor is chosen by preference:
+`coretemp` or `k10temp` labelled as the package, then a thermal zone that
+names a processor, because a machine typically exposes a dozen zones of which
+most measure the chassis or a chipset.
+
+### Two things this mode has to get right
+
+**Needles need smoothing, gauges need none.** A download rate measured over a
+tenth of a second varies far more than the quantity being displayed, so the
+mapped values pass through an exponential average whose time constant is set
+by `--smoothing`. The average is computed from elapsed time rather than a
+fixed weight, so the response is the same whether the sender runs at 5 Hz or
+50 Hz. The mapping is evaluated on every transmitted frame rather than once
+per sample, which is what lets the needles ease continuously between readings.
+
+**The fuel gauge damping has to be switched off.** `cfg::fuel::EnableSlew`
+exists so that the gauge behaves like a real tank, which the cluster expects:
+a step change in level reads as refuelling. At 1.5 percent of tank per second
+a full scale change takes over a minute, which is useless for an indicator
+tracking processor load. This branch therefore has that damping disabled,
+**so the firmware needs reflashing when switching between this mode and the
+vehicle telemetry modes.**
+
+A consequence of keeping the cluster convinced the engine is running: the
+firmware floors engine speed at idle, so the tachometer cannot read below
+about 800 rpm however little memory is in use. Reporting zero instead would
+make the cluster treat the engine as stalled and raise its own warnings.
+
 ## Game telemetry: ETS2 / ATS
 
 `host/run_ets2.py` drives the same jig from Euro Truck Simulator 2 (or American
@@ -907,6 +962,7 @@ E90_Cluster/              standalone ESP32 sketch (older: no clock, symbols
 drive.sh                  one command: fix whatever is broken, then drive
 host/run.py               simulator entry point
 host/run_ets2.py          ETS2 / ATS entry point
+host/run_sysmon.py        system monitor entry point
 host/ambient_resistor.py  temperature <-> resistor for the pins 4-5 NTC
 
 host/cluster_sim/link.py        serial framing, must match include/HostProtocol.h
@@ -916,6 +972,7 @@ host/cluster_sim/gauges.py      dials, needles, glow, telltale icons
 host/cluster_sim/gui.py         cluster layout, telemetry rail, keyboard
 host/cluster_sim/ets2.py        scsTelemetryMap_t reader + game -> cluster mapping
 host/cluster_sim/ets2_plugin.py reader for our plugin's block, same mapping
+host/cluster_sim/sysmon.py      system metrics and their mapping to the dials
 
 plugin/src/cluster_telemetry.cpp  the ETS2/ATS plugin itself (builds with g++)
 plugin/include/cluster_shm.h      the published block - the C/Python contract
