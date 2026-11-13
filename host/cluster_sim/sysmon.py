@@ -371,6 +371,12 @@ class Mapper:
         sp.fuel_l = cpu * opt.tank_litres
         sp.coolant_c = int(round(celsius))
 
+        # The gauge must not be damped here. The firmware models a real tank
+        # by default, where a full scale change takes over a minute, which
+        # would hide the load entirely. Requesting it per frame is what lets
+        # this mode and the vehicle modes share one firmware build.
+        sp.fuel_direct = True
+
         # The cluster must believe the engine is running: with the ignition on
         # and the crankshaft at rest it reports a stall and raises a group of
         # telltales. This also means the tachometer cannot read below the idle
@@ -436,6 +442,7 @@ def selftest() -> None:
     assert abs(sp.fuel_l - 15.0) < 0.01, sp.fuel_l
     assert sp.coolant_c == 55, sp.coolant_c
     assert sp.warn == 0, hex(sp.warn)
+    assert sp.fuel_direct, "load on the fuel gauge requires the damping off"
     assert sp.kl15 and sp.engine, "the cluster must see a running engine"
 
     # Full scale on every dial, and a link faster than the rated speed must

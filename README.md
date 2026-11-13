@@ -436,13 +436,25 @@ fixed weight, so the response is the same whether the sender runs at 5 Hz or
 50 Hz. The mapping is evaluated on every transmitted frame rather than once
 per sample, which is what lets the needles ease continuously between readings.
 
-**The fuel gauge damping has to be switched off.** `cfg::fuel::EnableSlew`
-exists so that the gauge behaves like a real tank, which the cluster expects:
-a step change in level reads as refuelling. At 1.5 percent of tank per second
-a full scale change takes over a minute, which is useless for an indicator
-tracking processor load. This branch therefore has that damping disabled,
-**so the firmware needs reflashing when switching between this mode and the
-vehicle telemetry modes.**
+**The fuel gauge damping has to be switched off, at run time.**
+`cfg::fuel::EnableSlew` exists so that the gauge behaves like a real tank,
+which the cluster expects: a step change in level reads as refuelling. At
+1.5 percent of tank per second a full scale change takes over a minute, which
+is useless for an indicator tracking processor load.
+
+Rather than building a second firmware, the damping is selected per frame.
+The host sets `HF2_FUEL_DIRECT` in the extra flags and the firmware obeys it,
+so **one build serves both this mode and the vehicle telemetry modes and
+nothing has to be reflashed to switch.** `run_sysmon.py` sets the flag and the
+vehicle modes leave it clear; the configuration constant is now only the value
+used at power-up and whenever the host link drops, which is when the local
+sweep takes over and the gauge should behave like a tank again. The console
+command `a 0` and `a 1` toggles it by hand, and `?` reports which is active.
+
+Measured against the real driver: with damping on, a request to move from 10
+to 60 litres has advanced from 1510 to 1541 sender counts after half a second
+and reaches full scale after about 90 seconds. With the flag set, the same
+request reaches full scale within 200 ms.
 
 A consequence of keeping the cluster convinced the engine is running: the
 firmware floors engine speed at idle, so the tachometer cannot read below

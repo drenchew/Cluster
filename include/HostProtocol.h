@@ -60,7 +60,10 @@ enum HostExtraFlag : uint8_t {
     HostExtraTractionMode = 0x01,
     HostExtraIntervening = 0x02,
     HostExtraStabilityOff = 0x04,
-    HostExtraClockValid = 0x08
+    HostExtraClockValid = 0x08,
+    /// Report the fuel level without gauge damping. Set by hosts that drive
+    /// the gauge from a fast changing quantity rather than a tank level.
+    HostExtraFuelDirect = 0x10
 };
 
 /**

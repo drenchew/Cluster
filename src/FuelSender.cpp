@@ -67,8 +67,16 @@ uint16_t FuelSender::counts(float fraction, FuelSenderSide side) {
     return result;
 }
 
+void FuelSender::setDamping(bool enabled) {
+    damping_ = enabled;
+}
+
+bool FuelSender::damping() const {
+    return damping_;
+}
+
 void FuelSender::update(float targetLitres, uint32_t nowMs) {
-    if (!cfg::fuel::EnableSlew || displayedLitres_ < 0.0f) {
+    if (!damping_ || displayedLitres_ < 0.0f) {
         displayedLitres_ = targetLitres;
         lastUpdateMs_ = nowMs;
     } else {

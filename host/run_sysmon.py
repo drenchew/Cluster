@@ -17,10 +17,10 @@ The dials read:
 Telltales light for sustained processor load, memory nearly exhausted and a
 hot processor.
 
-This build needs the fuel gauge damping switched off in the firmware, because
-the gauge is showing a live measurement rather than the level in a tank. See
-cfg::fuel::EnableSlew in include/Config.h; the firmware on this branch has it
-disabled already.
+The fuel gauge damping is switched off per frame, because the gauge is showing
+a live measurement rather than the level in a tank. The firmware obeys that
+request, so the same build serves this mode and the vehicle telemetry modes
+and nothing needs reflashing to switch between them.
 
 Setpoints are pushed at 50 Hz and the firmware owns the CAN timing, so
 stopping this program never resets the cluster: it falls back to its own demo

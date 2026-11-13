@@ -46,6 +46,11 @@ HF2_TC_LAMP = 0x01       # "DTC" traction-mode lamp
 HF2_DSC_LAMP = 0x02      # DSC triangle - flashed while actually intervening
 HF2_DSC_OFF = 0x04       # DSC switched off, solid
 HF2_CLOCK = 0x08         # the clock fields are valid
+# Report the fuel level without the firmware's gauge damping. The damping
+# models a real tank and is what the cluster expects, so it stays on for
+# vehicle telemetry; a host driving the gauge from a fast changing quantity
+# sets this instead, which avoids needing a different firmware build.
+HF2_FUEL_DIRECT = 0x10
 
 # cfg::warn in include/Config.h. Like the traction lamps these are
 # check-control symbols on 0x592, not telltale bits - the cluster has no
@@ -104,6 +109,12 @@ class Setpoints:
     # successive 100 ms slots, so setting several at once is free here.
     warn: int = 0
 
+    # ---- fuel gauge behaviour ----------------------------------------------
+    # False makes the gauge behave like a tank, which is correct for a
+    # vehicle. True makes it follow the setpoint immediately, for a host that
+    # is displaying something other than a fuel level on it.
+    fuel_direct: bool = False
+
     # ---- cruise control -----------------------------------------------------
     # Set speed in km/h on 0x193; 0 means cruise is off and the telltale goes
     # out. The cluster shows the number itself, so there is nothing to format.
@@ -126,6 +137,7 @@ class Setpoints:
             (HF2_TC_LAMP if self.tc_lamp else 0)
             | (HF2_DSC_LAMP if self.dsc_lamp else 0)
             | (HF2_DSC_OFF if self.dsc_off else 0)
+            | (HF2_FUEL_DIRECT if self.fuel_direct else 0)
         )
         c = self.clock
         if c is None:

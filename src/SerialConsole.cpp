@@ -29,6 +29,7 @@ constexpr char CmdWarnings = 'm';
 constexpr char CmdCruise = 'v';
 constexpr char CmdSymbol = 'y';
 constexpr char CmdDemo = 'd';
+constexpr char CmdFuelDamping = 'a';
 constexpr char CmdStatus = '?';
 
 /// Bit positions used by the traction lamp and turn signal commands.
@@ -85,6 +86,8 @@ void SerialConsole::printStatus() const {
                 static_cast<unsigned>(cluster_.clock().second()),
                 cluster_.clock().isValid() ? "(sent on 0x39E)"
                                            : "(never set - no 0x39E yet)");
+    diag::printf("fuel gauge %s\n",
+                 cluster_.fuelDamping() ? "damped (tank)" : "direct (live)");
     diag::printf("tx %lu fail %lu rx %lu | host %s frames %lu err %lu\n",
                 static_cast<unsigned long>(stats.transmitted),
                 static_cast<unsigned long>(stats.failed),
@@ -302,6 +305,12 @@ void SerialConsole::execute(char command, const char *argument) {
         case CmdDemo:
             demo_.resume();
             Serial.println(F("demo sweep resumed"));
+            break;
+
+        case CmdFuelDamping:
+            cluster_.setFuelDamping(truthy);
+            Serial.println(truthy ? F("fuel gauge damped (tank behaviour)")
+                                  : F("fuel gauge direct (live measurement)"));
             break;
 
         case CmdStatus:

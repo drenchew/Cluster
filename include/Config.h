@@ -215,12 +215,11 @@ constexpr uint16_t PermilleFullScale = 1000;
 /// A real gauge is heavily damped and treats a step change as refuelling.
 /// The transmitted level therefore follows the setpoint at a limited rate.
 ///
-/// Disabled on this branch. The fuel gauge here displays processor load
-/// rather than the contents of a tank, and at the rate below a full scale
-/// change would take over a minute to appear, which makes the needle useless
-/// as an indicator. Re-enable it for the vehicle telemetry modes, where the
-/// damping is what makes the gauge behave like a real one.
-constexpr bool EnableSlew = false;
+/// This is the value used at power-up and whenever the host link is lost. The
+/// host can override it per frame, and the console can toggle it, because the
+/// gauge is also used to display quantities that change far faster than a
+/// fuel level. See FuelSender::setDamping.
+constexpr bool EnableSlew = true;
 constexpr float SlewFractionPerSecond = 0.015f;
 constexpr uint32_t SlewIntervalMs = 50;
 }  // namespace fuel

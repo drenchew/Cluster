@@ -29,6 +29,8 @@
  *            8 coolant, 16 fuel, 32 AdBlue, 64 brake, 128 tyre pressure
  *   v 0..250 cruise control set speed, km/h; 0 switches it off
  *   y 357 1  display or clear any check control symbol by identifier
+ *   a 0|1    fuel gauge damping: 1 behaves like a tank, 0 follows
+ *            the setpoint at once for a live measurement
  *   ?        print driver and link state
  */
 

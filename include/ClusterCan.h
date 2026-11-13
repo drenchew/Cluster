@@ -69,6 +69,13 @@ public:
     /// Cruise control set speed in km/h; zero switches the telltale off.
     void setCruise(uint8_t kmh);
 
+    /// Enables or disables fuel gauge damping. Disabled makes the needle
+    /// follow the setpoint immediately, which is required when the gauge is
+    /// displaying something that changes faster than a tank can empty.
+    void setFuelDamping(bool enabled);
+
+    bool fuelDamping() const;
+
     /// Selects how the distance accumulator advances and restarts it.
     void setOdometerMode(OdometerMode mode);
 

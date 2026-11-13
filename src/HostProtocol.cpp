@@ -116,6 +116,9 @@ void HostProtocol::apply(ClusterCan &cluster) {
                              (frame.extraFlags & HostExtraStabilityOff) != 0);
     cluster.setWarnings(frame.warningMask);
     cluster.setCruise(frame.cruiseKmh);
+    // Absent flag means a tank level, which is damped; set means a live
+    // measurement, which must not be.
+    cluster.setFuelDamping((frame.extraFlags & HostExtraFuelDirect) == 0);
 
     // A host with no clock of its own leaves the flag clear, and the cluster
     // keeps running the time it already holds.

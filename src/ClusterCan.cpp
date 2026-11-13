@@ -80,6 +80,14 @@ void ClusterCan::setCruise(uint8_t kmh) {
     state_.setCruiseKmh(kmh);
 }
 
+void ClusterCan::setFuelDamping(bool enabled) {
+    fuel_.setDamping(enabled);
+}
+
+bool ClusterCan::fuelDamping() const {
+    return fuel_.damping();
+}
+
 void ClusterCan::setOdometerMode(OdometerMode mode) {
     state_.setOdometerMode(mode);
     distanceRemainder_ = 0.0f;
@@ -89,6 +97,9 @@ void ClusterCan::clearDriverRequests() {
     setTractionLamps(false, false, false);
     setWarnings(0);
     setCruise(0);
+    // The local sweep presents a vehicle, so the gauge returns to behaving
+    // like one rather than keeping whatever the last host asked for.
+    setFuelDamping(cfg::fuel::EnableSlew);
 }
 
 // ---------------------------------------------------------------------------

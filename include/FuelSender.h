@@ -31,6 +31,19 @@ public:
     FuelSender() = default;
 
     /**
+     * @brief Enables or disables the damping.
+     *
+     * The damping models a real tank, which is what the cluster expects from
+     * a fuel gauge. It has to be switchable at run time because the gauge is
+     * also used to display quantities that change far faster than a fuel
+     * level, where a limited rate of change would hide the signal entirely.
+     * Disabling it makes the displayed level follow the setpoint at once.
+     */
+    void setDamping(bool enabled);
+
+    bool damping() const;
+
+    /**
      * @brief Moves the displayed level towards the setpoint.
      *
      * The first call adopts the setpoint immediately so that the gauge does
@@ -54,4 +67,5 @@ private:
     /// Negative until the first update, which marks the level as unset.
     float displayedLitres_ = -1.0f;
     uint32_t lastUpdateMs_ = 0;
+    bool damping_ = cfg::fuel::EnableSlew;
 };
