@@ -288,12 +288,35 @@ class MapOptions:
     # is expressed as a fraction of this tank size.
     tank_litres: float = 60.0
 
+    # Processor load is mapped onto the range [fuel_floor_litres, tank_litres]
+    # rather than from empty.
+    #
+    # The cluster raises its own low fuel warning from the level on 0x349,
+    # independently of anything this host asks for: on an E9x the reserve
+    # warning appears at about 8 litres of 60. Mapping load from an empty tank
+    # would therefore light the reserve telltale and sound the chime whenever
+    # the machine was merely idle, which is both wrong and impossible to
+    # silence from here. Starting the range above that threshold avoids the
+    # warning entirely at the cost of the lowest quarter of the dial.
+    #
+    # 15 litres leaves a margin over the 8 litre threshold for the non-linear
+    # sender curve and for whatever hysteresis the cluster applies. Lower it
+    # if the needle on a particular cluster stays clear of the warning.
+    fuel_floor_litres: float = 15.0
+
     # Processor temperature goes to the coolant gauge unchanged, since both are
     # temperatures in degrees Celsius. A machine with no readable sensor shows
     # this instead, which keeps the needle off the cold stop.
     fallback_celsius: int = 60
 
     # Telltales. Each is a fraction of full scale except the temperature.
+    #
+    # Memory uses the tyre pressure symbol rather than the fuel reserve one.
+    # The fuel gauge already displays processor load here, so a reserve
+    # telltale beside it would appear to refer to that gauge; and the cluster
+    # raises the reserve warning itself, so the symbol is not ours to assign.
+    # Tyre pressure is free because no tyre pressure data is transmitted, and
+    # it reads as a pressure warning, which is what memory pressure is.
     warn_cpu_load: float = 0.90
     warn_memory_used: float = 0.90
     warn_cpu_celsius: float = 85.0
@@ -368,7 +391,8 @@ class Mapper:
         sp = lk.Setpoints()
         sp.speed_kmh = int(round(download * opt.max_speed_kmh))
         sp.rpm = int(round(memory * opt.max_rpm))
-        sp.fuel_l = cpu * opt.tank_litres
+        usable = max(0.0, opt.tank_litres - opt.fuel_floor_litres)
+        sp.fuel_l = opt.fuel_floor_litres + cpu * usable
         sp.coolant_c = int(round(celsius))
 
         # The gauge must not be damped here. The firmware models a real tank
@@ -396,7 +420,7 @@ class Mapper:
         if cpu >= opt.warn_cpu_load:
             warn |= lk.WARN_CHECK_ENGINE
         if memory >= opt.warn_memory_used:
-            warn |= lk.WARN_FUEL
+            warn |= lk.WARN_TYRE
         if celsius >= opt.warn_cpu_celsius:
             warn |= lk.WARN_COOLANT
         sp.warn = warn
@@ -426,6 +450,12 @@ def describe(reading: Reading, sp: lk.Setpoints, opt: MapOptions) -> str:
 # Self test
 # ---------------------------------------------------------------------------
 
+# The level at which the cluster raises its own low fuel warning, from the
+# vehicle simulator's figure for a real E9x. Used by the self test to prove the
+# mapping can never reach it.
+RESERVE_WARNING_LITRES = 8.0
+
+
 def selftest() -> None:
     """Checks the mapping with synthetic readings, so no hardware is needed."""
     opt = MapOptions(max_download_mbit=100.0, smoothing_seconds=0.0)
@@ -439,7 +469,10 @@ def selftest() -> None:
     sp = mapper.to_setpoints(half, now=0.0)
     assert sp.speed_kmh == 130, sp.speed_kmh
     assert sp.rpm == 2750, sp.rpm
-    assert abs(sp.fuel_l - 15.0) < 0.01, sp.fuel_l
+    # A quarter load sits a quarter of the way up the usable range, which
+    # starts at the floor rather than at empty.
+    expected = opt.fuel_floor_litres + 0.25 * (opt.tank_litres - opt.fuel_floor_litres)
+    assert abs(sp.fuel_l - expected) < 0.01, (sp.fuel_l, expected)
     assert sp.coolant_c == 55, sp.coolant_c
     assert sp.warn == 0, hex(sp.warn)
     assert sp.fuel_direct, "load on the fuel gauge requires the damping off"
@@ -455,15 +488,28 @@ def selftest() -> None:
     assert sp.rpm == opt.max_rpm, sp.rpm
     assert abs(sp.fuel_l - opt.tank_litres) < 0.01, sp.fuel_l
     assert sp.warn & lk.WARN_CHECK_ENGINE
-    assert sp.warn & lk.WARN_FUEL
+    assert sp.warn & lk.WARN_TYRE, "memory pressure uses the tyre symbol"
     assert sp.warn & lk.WARN_COOLANT
+    assert not (sp.warn & lk.WARN_FUEL), \
+        "the reserve symbol belongs to the cluster, not to this mapping"
 
-    # An idle machine sits at the bottom of every dial.
+    # An idle machine sits at the bottom of every dial, except that the fuel
+    # gauge stops short of the cluster's own reserve warning.
     mapper = Mapper(opt)
     idle = Reading(cpu_celsius=40.0)
     sp = mapper.to_setpoints(idle, now=0.0)
     assert sp.speed_kmh == 0 and sp.rpm == 0, (sp.speed_kmh, sp.rpm)
-    assert sp.fuel_l == 0.0
+    assert abs(sp.fuel_l - opt.fuel_floor_litres) < 0.01, sp.fuel_l
+
+    # The whole point of the floor: no processor load, however low, may put
+    # the needle into reserve, because the cluster would raise a warning this
+    # host has no way to clear.
+    for percent in range(0, 101):
+        level = mapper.to_setpoints(
+            Reading(cpu_load=percent / 100.0, cpu_celsius=40.0), now=0.0).fuel_l
+        assert level > RESERVE_WARNING_LITRES, (percent, level)
+    assert mapper.to_setpoints(
+        Reading(cpu_load=1.0, cpu_celsius=40.0), now=0.0).fuel_l <= opt.tank_litres
 
     # A machine with no temperature sensor must not read as frozen.
     mapper = Mapper(opt)

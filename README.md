@@ -410,12 +410,14 @@ python3 run_sysmon.py --selftest      # mapping checks
 |---|---|---|
 | speedometer | network download rate | `--max-mbit`, default 100 Mbit/s, maps to 260 km/h |
 | tachometer | memory in use | 5500 rpm, the diesel redline |
-| fuel gauge | processor load | a full tank is 100 percent |
+| fuel gauge | processor load | `--fuel-floor-l` (default 15 l) at idle up to a full tank |
 | coolant gauge | processor temperature | degrees Celsius, passed through unchanged |
 | clock | the host clock | |
 
 Telltales light on sustained load: check engine above 90 percent processor,
-fuel reserve above 90 percent memory, and the coolant warning above 85 °C.
+tyre pressure above 90 percent memory, and the coolant warning above 85 °C.
+Memory uses the tyre pressure symbol rather than the fuel reserve one for the
+reason given below.
 
 Every value comes from `/proc` and `/sys`, so the only dependency is the
 `pyserial` the rest of the host tooling already needs. Memory in use is
@@ -426,7 +428,26 @@ as nearly full. The processor temperature sensor is chosen by preference:
 names a processor, because a machine typically exposes a dozen zones of which
 most measure the chassis or a chipset.
 
-### Two things this mode has to get right
+### Three things this mode has to get right
+
+**The fuel gauge must not be taken down to empty.** The cluster raises its own
+low fuel warning from the level it is sent on 0x349, independently of anything
+the host asks for; on an E9x the reserve warning appears at about 8 litres of
+60. Mapping processor load from an empty tank therefore lights the reserve
+telltale and sounds the chime whenever the machine is merely idle — and
+because the cluster raised that warning itself, the host cannot clear it.
+
+Load is instead mapped onto the range from `--fuel-floor-l` to a full tank,
+15 litres by default. That leaves a margin over the 8 litre threshold for the
+non-linear sender curve and for whatever hysteresis the cluster applies, at
+the cost of the lowest quarter of the dial. The self test sweeps load from 0
+to 100 percent and asserts that the level never reaches the warning.
+
+For the same reason the fuel reserve symbol is not used for anything here.
+The gauge beside it already means processor load, so a reserve telltale would
+appear to refer to that gauge, and the symbol belongs to the cluster. Memory
+pressure uses the tyre pressure symbol instead: it is free, because no tyre
+pressure data is transmitted, and it reads as a pressure warning.
 
 **Needles need smoothing, gauges need none.** A download rate measured over a
 tenth of a second varies far more than the quantity being displayed, so the

@@ -17,6 +17,11 @@ The dials read:
 Telltales light for sustained processor load, memory nearly exhausted and a
 hot processor.
 
+Processor load is mapped onto the upper part of the fuel gauge, not the whole
+of it. The cluster raises its own low fuel warning from the level it is sent,
+so a needle taken down to empty at idle would light the reserve telltale and
+sound the chime. See --fuel-floor-l.
+
 The fuel gauge damping is switched off per frame, because the gauge is showing
 a live measurement rather than the level in a tank. The firmware obeys that
 request, so the same build serves this mode and the vehicle telemetry modes
@@ -63,6 +68,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="tachometer full scale (default 5500)")
     parser.add_argument("--tank-l", type=float, default=60.0,
                         help="fuel gauge full scale in litres (default 60)")
+    parser.add_argument("--fuel-floor-l", type=float, default=15.0,
+                        help="litres the fuel gauge reads at zero load. Keeps "
+                             "the needle clear of the cluster's own reserve "
+                             "warning, which appears near 8 l (default 15)")
     parser.add_argument("--smoothing", type=float, default=0.45,
                         help="needle smoothing half-life in seconds (default 0.45)")
     parser.add_argument("--no-clock", action="store_true",
@@ -101,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         max_speed_kmh=args.max_speed,
         max_rpm=args.max_rpm,
         tank_litres=args.tank_l,
+        fuel_floor_litres=args.fuel_floor_l,
         smoothing_seconds=args.smoothing,
         show_clock=not args.no_clock,
     ))
@@ -112,7 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"interfaces : {', '.join(metrics.interfaces) or 'none found'}")
     print(f"temperature: {metrics.temperature_path or 'no sensor found'}")
     print(f"full scale : {args.max_mbit:.0f} Mbit/s -> {args.max_speed} km/h, "
-          f"memory -> {args.max_rpm} rpm, load -> {args.tank_l:.0f} l")
+          f"memory -> {args.max_rpm} rpm, "
+          f"load -> {args.fuel_floor_l:.0f}..{args.tank_l:.0f} l")
     print(f"serial     : {port_text}")
     print()
     if not metrics.interfaces:
