@@ -7,7 +7,7 @@ Tuned to behave like the 2.0 litre diesel the A2C53117692 cluster came behind
 What makes a diesel feel like a diesel, and what this models:
 
 * **Turbo lag.** Only about a third of peak torque is available off boost.
-  Stab the throttle at 1200 rpm and you get that third, then the rest arrives
+  A stab of throttle at 1200 rpm delivers that third, and the rest arrives
   over the next half second as the turbo spools. Below the boost threshold it
   never arrives at all. This is the single biggest contributor to the
   character, and the torque curve alone does not capture it.
@@ -151,7 +151,7 @@ IDLE_L_PER_HOUR = 0.65
 # of the gauge - real, but on a bench the needle looks frozen. The sim runs at
 # the true rate by default now that the tank can be filled and set from the
 # keyboard; ``Controls.fuel_fast`` multiplies the *tank* drain by this so the
-# gauge visibly moves, and leaves the l/100km readout honest either way.
+# gauge moves visibly, and keeps the l/100km readout accurate either way.
 FUEL_BURN_SCALE = 25.0
 
 # ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ class Vehicle:
     # ---- live engine state, read by the audio and the dashboard ----------
     boost: float = 0.0          # 0..1 fraction of full boost
     fuelling: float = 0.0       # 0..1 actual injected fuelling after cuts
-    wheelspin: float = 0.0      # 0..1 how far past the traction limit we are
+    wheelspin: float = 0.0      # 0..1 margin past the traction limit
     tc_cut: float = 0.0         # 0..1 fuelling DSC is currently taking away
     tc_lamp: float = 0.0        # >0 while the intervention lamp should be lit
     pop: float = 0.0            # 0..1 overrun crackle intensity

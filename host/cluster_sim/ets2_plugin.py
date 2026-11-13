@@ -238,7 +238,7 @@ class Source:
 
         The plugin makes ``seq`` odd while it copies a frame in and even
         again when it is done, so reading it either side of the copy tells us
-        whether we caught a frame mid-flight. Three tries is generous: the
+        whether a partially written frame was read. Three attempts suffice: the
         write is a 500 byte memcpy, and the game would have to be unlucky
         twice in a row to lose the race.
         """
@@ -270,7 +270,7 @@ class Source:
 
         if block.magic != MAGIC:
             # Either the game has shut the plugin down - which clears magic
-            # on purpose - or we opened something else entirely.
+            # on purpose, or the mapping belongs to something else.
             self.last_error = (f"not our block (magic 0x{block.magic:08x}) - "
                                f"the game may have exited")
             return None
@@ -546,7 +546,7 @@ def selftest() -> None:
     # A block the plugin has shut down must not be served as live data.
     dead = ClusterShm.from_buffer_copy(bytes(b))
     dead.magic = 0
-    src = Source.__new__(Source)          # no mapping, just the checks
+    src = Source.__new__(Source)          # no mapping, only the checks
     src.revid = src.revid_warning = src.last_error = src.truck = None
     assert dead.magic != MAGIC
 

@@ -8,7 +8,7 @@ whole ``scsTelemetryMap_t`` struct into one 32 KiB shared-memory block:
 
 The struct layout below mirrors ``scs-telemetry/inc/scs-telemetry-common.hpp``
 at PLUGIN_REVID 12, byte for byte, and ``verify_layout()`` re-checks the
-documented zone offsets every time we load - a plugin that changes the
+documented zone offsets on every load. A plugin that changes the
 contract fails loudly instead of feeding garbage into the CAN bus.
 
 Proton / Wine caveat: a Windows game build puts the mapping inside its Wine
@@ -36,7 +36,7 @@ from . import link as lk
 
 MAP_SIZE = 32 * 1024          # SCS_PLUGIN_MMF_SIZE
 SHM_NAME = "SCSTelemetry"     # POSIX name; Windows wants the Local\ prefix
-BYTES_UPTO_ZONE10 = 4000      # offset of the first zone we treat as opaque
+BYTES_UPTO_ZONE10 = 4000      # offset of the first zone treated as opaque
 
 # The struct below mirrors PLUGIN_REVID 12. Revision 13 only appends a zone
 # and keeps every revision-12 offset, so it reads fine too. Anything else may
@@ -465,7 +465,7 @@ class ShmSource:
     produced a telemetry frame for ``stale_s``, or the mapping does not exist
     yet. The firmware's own host watchdog covers the gap: stop sending for
     1.5 s and the cluster falls back to its demo sweep instead of holding
-    whatever we last pushed.
+    the last values sent.
     """
 
     def __init__(self, stale_s: float = 0.75, name: str | None = None):
@@ -478,7 +478,7 @@ class ShmSource:
         self._last_move = 0.0
         self.name: str | None = None      # whichever candidate actually opened
         self.last_error: str | None = None
-        self.revid: int | None = None     # plugin revision, once we have seen one
+        self.revid: int | None = None     # plugin revision, once one is seen
         self.revid_warning: str | None = None
 
     # -- plumbing ----------------------------------------------------------
@@ -697,7 +697,7 @@ def _vdf_paths(vdf_text: str) -> list[str]:
 
 
 def steam_libraries() -> list[tuple[str, str]]:
-    """(kind, path) for every Steam library root we can find."""
+    """(kind, path) for every Steam library root that can be located."""
     seen, out = set(), []
     for kind, root in STEAM_ROOTS:
         base = os.path.expanduser(root)
@@ -844,8 +844,8 @@ def _open_mapping(name: str):
         FILE_MAP_READ = 0x0004
         full = name if "\\" in name else f"Local\\{name}"
         # Probe without creating: mmap's tagname path would happily mint a
-        # fresh all-zero block when the game is not running, which is exactly
-        # the state we must not mistake for "game present but not framing".
+        # fresh all-zero block when the game is not running, which must not
+        # be mistaken for a game that is present but not producing frames.
         probe = k32.OpenFileMappingW(FILE_MAP_READ, 0, full)
         if not probe:
             raise FileNotFoundError(f"no mapping {full} (is the game running?)")
@@ -879,6 +879,12 @@ TC_SLIP_ON = 0.08          # fraction of slip that counts as an intervention
 TC_SLIP_FULL = 0.35        # and where it is unambiguous
 TC_MIN_THROTTLE = 0.05     # a locked wheel under braking is not wheelspin
 
+# ETS2 has no MIL channel - no "check engine" bit exists in the telemetry at
+# all - so the lamp stands in for a worn-out engine, which is the condition
+# the game does model and the one that actually costs you money. 0.55 is past
+# the point where the game starts nagging about a service.
+CHECK_ENGINE_WEAR = 0.55
+
 
 @dataclass
 class MapOptions:
@@ -888,7 +894,7 @@ class MapOptions:
     speed_scale: float = 1.0
     tank_l: float = 60.0       # car-tank size the fuel gauge is calibrated for
     lights_on: bool = False    # force side + low beam regardless of the game
-    # "game" puts the in-game clock on the cluster (what you want while
+    # "game" puts the in-game clock on the cluster (appropriate while
     # driving a 03:00 delivery), "system" the PC's, "off" leaves the cluster's
     # own clock running.
     clock: str = "game"
@@ -908,7 +914,7 @@ def wheel_slip(f: ScsTelemetry) -> float:
     8.00. So one turn of the wheel covers its circumference, 2*pi*r, and the
     2*pi here is not optional. Leaving it out scales surface speed to 16% of
     the truth, which makes slip permanently negative, which clamps to zero -
-    the lamp simply never lights, with nothing to show you why.
+    the lamp never lights, and no error is reported.
     """
     speed = abs(_num(f.truck_f.speed))
     count = int(f.config_ui.truckWheelCount or 0)
@@ -1011,6 +1017,35 @@ def to_setpoints(f: ScsTelemetry, opt: MapOptions | None = None) -> lk.Setpoints
     sp.dsc_lamp = slip > TC_SLIP_ON and throttle > TC_MIN_THROTTLE
     sp.tc_lamp = bool(f.truck_b.differentialLock)
 
+    # Warning lamps. Everything here is a flag the game already raises for
+    # the truck's own dash, so the cluster ends up showing the same warnings
+    # the in-game cluster does - except check engine, which the game has no
+    # channel for and which engine wear stands in for.
+    warn = 0
+    if _num(f.truck_f.wearEngine) > CHECK_ENGINE_WEAR:
+        warn |= lk.WARN_CHECK_ENGINE
+    if f.truck_b.oilPressureWarning:
+        warn |= lk.WARN_OIL
+    if f.truck_b.batteryVoltageWarning:
+        warn |= lk.WARN_BATTERY
+    if f.truck_b.waterTemperatureWarning:
+        warn |= lk.WARN_COOLANT
+    if f.truck_b.fuelWarning:
+        warn |= lk.WARN_FUEL
+    if f.truck_b.adblueWarning:
+        warn |= lk.WARN_ADBLUE
+    # A truck losing air is a red brake warning, which is the closest the E9x
+    # has to "the brakes will not work properly".
+    if f.truck_b.airPressureWarning or f.truck_b.airPressureEmergency:
+        warn |= lk.WARN_BRAKE
+    sp.warn = warn
+
+    # Cruise control. The set speed is the only signal the game gives - it
+    # sits at zero when cruise is off - so that doubles as the on/off state,
+    # and the cluster prints the number itself.
+    cruise = _num(f.truck_f.cruiseControlSpeed) * 3.6
+    sp.cruise_kmh = int(round(cruise)) if cruise > 1.0 else 0
+
     if opt.clock == "game":
         sp.clock = game_clock(f)
     elif opt.clock == "system":
@@ -1086,4 +1121,30 @@ def selftest() -> None:
     assert to_setpoints(rev).gear_pos == lk.GEAR_R
     assert to_setpoints(rev).reverse
 
-    print("ets2 selftest OK  (layout, roundtrip, mapping, slip, clock)")
+    # Warning lamps: nothing wrong with the truck above, so nothing lit.
+    assert sp.warn == 0, hex(sp.warn)
+
+    sick = ScsTelemetry.from_buffer_copy(raw)
+    sick.truck_f.wearEngine = 0.9
+    sick.truck_b.oilPressureWarning = True
+    sick.truck_b.fuelWarning = True
+    sick.truck_b.airPressureEmergency = True
+    w = to_setpoints(sick).warn
+    assert w & lk.WARN_CHECK_ENGINE, "worn engine should light check engine"
+    assert w & lk.WARN_OIL and w & lk.WARN_FUEL and w & lk.WARN_BRAKE
+    assert not (w & lk.WARN_BATTERY) and not (w & lk.WARN_ADBLUE)
+
+    # A nearly new engine must not light it - the threshold is the whole
+    # point, since every truck has some wear.
+    ok_engine = ScsTelemetry.from_buffer_copy(raw)
+    ok_engine.truck_f.wearEngine = 0.1
+    assert not (to_setpoints(ok_engine).warn & lk.WARN_CHECK_ENGINE)
+
+    # Cruise control: the set speed doubles as the on/off state.
+    assert sp.cruise_kmh == 0, sp.cruise_kmh
+    cc = ScsTelemetry.from_buffer_copy(raw)
+    cc.truck_f.cruiseControlSpeed = 25.0           # 90 km/h
+    assert to_setpoints(cc).cruise_kmh == 90, to_setpoints(cc).cruise_kmh
+
+    print("ets2 selftest OK  (layout, roundtrip, mapping, slip, clock, "
+          "warnings, cruise)")

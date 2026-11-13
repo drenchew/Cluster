@@ -1,17 +1,18 @@
-/*
- * cluster_shm.h - the block the ETS2/ATS plugin publishes for the cluster host.
+/**
+ * @file cluster_shm.h
+ * @brief Layout of the block published by the telemetry plugin.
  *
- * This is the contract between two languages: the plugin writes this struct
- * into POSIX shared memory, host/cluster_sim/ets2_plugin.py reads it back with
- * ctypes. Both sides assert their own idea of the layout, so a field added on
- * one side only is a loud failure at startup rather than a needle that reads
- * 40 km/h too high.
+ * This header is the contract between two languages. The plugin writes the
+ * structure into POSIX shared memory and host/cluster_sim/ets2_plugin.py
+ * reads it back through ctypes. Each side asserts its own view of the size,
+ * so a field added to one and not the other fails at startup rather than
+ * silently shifting every value that follows it.
  *
- * Rules when editing:
- *   - append, never insert, and bump CLUSTER_SHM_VERSION
- *   - keep every field naturally aligned (floats on 4, u64 on 8) so there is
- *     no implicit padding for ctypes to disagree about
- *   - the static_assert at the bottom is not decoration; keep it passing
+ * Rules for modification:
+ *   - append fields, never insert, and increment CLUSTER_SHM_VERSION
+ *   - keep every member naturally aligned so that no implicit padding is
+ *     introduced, since the two languages must agree on it
+ *   - the static assertion at the end is part of that contract
  */
 
 #ifndef CLUSTER_SHM_H
@@ -67,8 +68,8 @@ typedef struct cluster_shm_t {
     uint32_t paused;     /* 1 while the game is in a menu or loading */
 
     /* Minutes on the game's own calendar, which starts at an arbitrary
-       epoch and runs several times faster than the wall clock. Only the
-       time of day inside it is worth showing. */
+       epoch and advances faster than real time, so only the time of day it
+       represents is meaningful. */
     uint32_t time_abs;
 
     uint32_t wheel_count; /* how many entries of the wheel arrays are real */
@@ -155,11 +156,11 @@ typedef struct cluster_shm_t {
        agrees: a free-rolling 0.506 m wheel at 91.6 km/h reports 8.005, and
        25.44 / (2*pi * 0.506) is 8.00.
 
-       So surface speed is value * 2*pi * radius, which against the truck's
-       ground speed is wheelspin - the only way the game will tell you a
-       traction event is happening. Drop the 2*pi and surface speed comes out
-       at 16% of the truth, slip goes permanently negative, and the lamp
-       never lights. */
+       Surface speed is therefore value * 2*pi * radius. Compared against
+       the vehicle's ground speed this gives wheel slip, which is the only
+       indication the simulator provides that a traction event is occurring.
+       Omitting the factor reduces surface speed to about 16 percent of its
+       true value, which makes the computed slip permanently negative. */
     float wheel_angular_velocity[CLUSTER_WHEELS];
     float wheel_radius[CLUSTER_WHEELS]; /* metres, from the truck config */
 

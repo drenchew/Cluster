@@ -1,725 +1,665 @@
 #include "ClusterCan.h"
 
-// ============================================================================
-//  Raw SPI register read (bypasses the library) - diagnostic only.
-//  MCP2515 READ instruction = 0x03. A healthy chip returns ~0x80 (config mode)
-//  from CANSTAT right after power-up.
-//    reads 0x00  -> no reply: MISO not connected, module unpowered, or GND open
-//    reads 0xFF  -> MISO stuck high: miswire, or module unpowered
-//    reads 0x80  -> SPI link OK
-// ============================================================================
-uint8_t ClusterCan::rawReadReg(uint8_t addr) {
-  SPI.beginTransaction(SPISettings(cfg::SPI_HZ, MSBFIRST, SPI_MODE0));
-  digitalWrite(cfg::PIN_CS, LOW);
-  SPI.transfer(0x03);                 // READ
-  SPI.transfer(addr);
-  uint8_t v = SPI.transfer(0x00);
-  digitalWrite(cfg::PIN_CS, HIGH);
-  SPI.endTransaction();
-  return v;
+#include <Arduino.h>
+
+namespace {
+
+/// Extracts the low byte of a sixteen bit value.
+uint8_t lowByte16(uint16_t value) {
+    return static_cast<uint8_t>(value & frame::common::ByteMask);
 }
 
-bool ClusterCan::tryInit() {
-  if (mcp_.reset()               != MCP2515::ERROR_OK) return false;
-  if (mcp_.setBitrate(cfg::BUS_BITRATE, cfg::BUS_CLOCK) != MCP2515::ERROR_OK) return false;
-  if (mcp_.setNormalMode()       != MCP2515::ERROR_OK) return false;
-  return true;
+/// Extracts the high byte of a sixteen bit value.
+uint8_t highByte16(uint16_t value) {
+    return static_cast<uint8_t>(value >> frame::common::ByteBits);
 }
 
-// ============================================================================
-//  Setup - retries forever so you can fix wiring and watch it connect live
-//  without re-flashing. Returns true once the MCP2515 is up.
-// ============================================================================
+/// Advances a counter that wraps before the given modulus.
+uint8_t nextCounter(uint8_t value, uint8_t modulus) {
+    return static_cast<uint8_t>((value + 1) % modulus);
+}
+
+}  // namespace
+
+ClusterCan::ClusterCan(ICanBus &bus) : bus_(bus) {
+}
+
 bool ClusterCan::begin() {
-  pinMode(cfg::PIN_INT, INPUT_PULLUP);
-  pinMode(cfg::PIN_CS, OUTPUT);
-  digitalWrite(cfg::PIN_CS, HIGH);
-  SPI.begin();                          // Uno hardware SPI (D13/D12/D11)
-
-  for (uint32_t attempt = 1; ; ++attempt) {
-    uint8_t canstat = rawReadReg(0x0E);   // CANSTAT
-    if (tryInit()) {
-      logf("MCP2515 up (CANSTAT=0x%02X). Bitrate 100k / xtal 8MHz, normal mode.\n", canstat);
-      lastTick_ = millis();
-      return true;
+    const bool ready = bus_.begin();
+    if (ready) {
+        lastTickMs_ = millis();
     }
-    logf("MCP2515 reset FAIL (attempt %lu, CANSTAT raw=0x%02X) - ",
-         (unsigned long)attempt, canstat);
-    if (canstat == 0x00)      Serial.println(F("0x00: no SPI reply. Check GND, 5V power, and SO->D12."));
-    else if (canstat == 0xFF) Serial.println(F("0xFF: MISO stuck high. Check wiring / module power."));
-    else                      Serial.println(F("partial SPI reply. Check for loose jumpers / lower SPI clock."));
-    delay(1000);
-  }
+    return ready;
 }
 
-// ============================================================================
-//  Public API
-// ============================================================================
-
-/* While the engine is "running" the RPM is floored at idle. A cluster that is
- * told terminal 15 is on but the crank is at 0 rpm treats it as a stall and
- * answers with the gong plus the charge/oil/brake telltales - which is what
- * made the old demo sweep alarm once per cycle at the bottom of its ramp. */
-void ClusterCan::setRPM(uint16_t rpm) {
-  if (rpm > cfg::RPM_LIMIT) rpm = cfg::RPM_LIMIT;
-  if (engineOn_ && rpm < cfg::ENGINE_IDLE_RPM) rpm = cfg::ENGINE_IDLE_RPM;
-  rpm_ = rpm;
-}
-void ClusterCan::setSpeed(uint16_t kmh){ speedKmh_ = kmh > cfg::SPEED_LIMIT ? cfg::SPEED_LIMIT : kmh; }
-void ClusterCan::setPedal(uint8_t pct) { pedalPct_ = pct > 100 ? 100 : pct; }
-void ClusterCan::setFuelLitres(float l){ fuelDl_ = (uint16_t)(constrain(l, 0.0f, 80.0f) * 10.0f); }
-void ClusterCan::setCoolantC(int16_t c){ coolantC_ = constrain(c, (int16_t)-40, (int16_t)150); }
-void ClusterCan::setOutsideC(int16_t c){ outsideC_ = constrain(c, (int16_t)-40, (int16_t)80); }
-void ClusterCan::setRangeKm(uint16_t k){ rangeKm_ = k > 2000 ? 2000 : k; }
-void ClusterCan::setLights(uint8_t m)  { lights_ = m; }
-void ClusterCan::setDimmer(uint8_t l)  { dimmer_ = l; }
-void ClusterCan::setHandbrake(bool on) { handbrake_ = on; }
-void ClusterCan::setReverse(bool on)   { reverse_ = on; }
-
-void ClusterCan::setOdoMode(uint8_t m) {
-  odoMode_ = m > cfg::ODO_DISTANCE ? cfg::ODO_ALIVE : m;
-  distAccum_ = 0.0f;
+VehicleState &ClusterCan::state() {
+    return state_;
 }
 
-void ClusterCan::setSpeedSources(uint8_t m) { speedSrc_ = m & 0x03; }
-
-void ClusterCan::setTractionLamps(bool tcLamp, bool dscLamp, bool dscOff) {
-  sym_[SYM_DTC].want     = tcLamp;
-  sym_[SYM_DSC].want     = dscLamp;
-  sym_[SYM_DSC_OFF].want = dscOff;
+const VehicleState &ClusterCan::state() const {
+    return state_;
 }
 
-/* One spare symbol slot for anything else off the E92 check-control list.
- * Changing the id while the old symbol is showing has to clear the old one
- * first, or it stays on the display with nothing left to turn it off. */
-void ClusterCan::setSymbol(uint16_t id, bool on) {
-  SymSlot &sl = sym_[SYM_EXTRA];
-  if (sl.id != id) {
-    if (sl.sent) send592(sl.id, false);
-    sl.id   = id;
-    sl.sent = false;
-  }
-  sl.want = on;
+const TimeOfDay &ClusterCan::clock() const {
+    return clock_;
 }
 
-void ClusterCan::setClock(uint8_t hour, uint8_t minute, uint8_t second,
-                          uint8_t day, uint8_t month, uint16_t year) {
-  bool changed = (hour != hour_) || (minute != min_) || (second != sec_)
-              || (day != day_) || (month != month_) || (year != year_);
-  hour_  = hour  % 24;
-  min_   = minute % 60;
-  sec_   = second % 60;
-  day_   = (day   == 0 || day   > 31) ? 1 : day;
-  month_ = (month == 0 || month > 12) ? 1 : month;
-  year_  = year;
-  clockValid_ = true;
-  // The host is the time master: resynchronise the local second tick to its
-  // update so the two never drift a second apart and fight over the display.
-  if (changed) lastSecMs_ = millis();
+const ClusterFeedback &ClusterCan::feedback() const {
+    return feedback_;
 }
 
-void ClusterCan::setTurn(bool left, bool right) {
-  turn_ = (uint8_t)((left ? 0x01 : 0) | (right ? 0x02 : 0));
+uint16_t ClusterCan::odometerCounter() const {
+    return distanceCounter_;
 }
 
-void ClusterCan::setGear(uint8_t pos, uint8_t num, uint8_t mode) {
-  gearPos_  = pos;
-  gearNum_  = num > 8 ? 8 : num;
-  gearMode_ = mode > MODE_MANUAL ? MODE_NORMAL : mode;
+ICanBus::Statistics ClusterCan::statistics() const {
+    return bus_.statistics();
 }
 
-void ClusterCan::setEngineRunning(bool running) {
-  engineOn_ = running;
-  if (running) { if (rpm_ < cfg::ENGINE_IDLE_RPM) rpm_ = cfg::ENGINE_IDLE_RPM; }
-  else         { rpm_ = 0; }          // deliberate key-on-engine-off: expect the gong
+void ClusterCan::setClock(uint8_t hour, uint8_t minute, uint8_t second, uint8_t day,
+                          uint8_t month, uint16_t year) {
+    clock_.set(hour, minute, second, day, month, year, millis());
 }
 
-void ClusterCan::setTerminal15(bool on) { kl15_ = on; }
-
-static uint8_t daysInMonth(uint8_t month, uint16_t year) {
-  static const uint8_t len[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-  if (month < 1 || month > 12) return 31;
-  if (month == 2 && (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0))
-    return 29;
-  return len[month - 1];
+void ClusterCan::setTractionLamps(bool tractionMode, bool intervening, bool disabled) {
+    checkControl_.setLamp(CheckControl::Lamp::Dtc, tractionMode);
+    checkControl_.setLamp(CheckControl::Lamp::DscTriangle, intervening);
+    checkControl_.setLamp(CheckControl::Lamp::DscOff, disabled);
 }
 
-/* Advances the local clock off millis(). The host resynchronises it once a
- * second, but the clock has to keep running on its own: pull the USB cable and
- * the cluster must not freeze at the time the host died, and the demo sweep has
- * no clock of its own to offer. */
-void ClusterCan::tickClock(uint32_t now) {
-  if (lastSecMs_ == 0) { lastSecMs_ = now; return; }
-  while ((uint32_t)(now - lastSecMs_) >= 1000) {
-    lastSecMs_ += 1000;
-    if (++sec_ < 60) continue;
-    sec_ = 0;
-    if (++min_ < 60) continue;
-    min_ = 0;
-    if (++hour_ < 24) continue;
-    hour_ = 0;
-    if (++day_ <= daysInMonth(month_, year_)) continue;
-    day_ = 1;
-    if (++month_ <= 12) continue;
-    month_ = 1;
-    year_ = year_ + 1;
-  }
+void ClusterCan::setWarnings(uint8_t mask) {
+    state_.setWarningMask(mask);
+    checkControl_.applyWarningMask(mask);
 }
 
-/* Fuel tables: counts per sender at a given fill fraction, in permille so the
- * interpolation stays in integers. See cfg::FUEL_CURVE_REAL for where these
- * numbers come from and why a flat litres*160 is wrong. */
-static const uint16_t kFuelFrac[6]  PROGMEM = {1000, 875, 750, 500, 250,   0};
-static const uint16_t kFuelLeft[6]  PROGMEM = {9700, 8200, 6250, 3600, 1950, 625};
-static const uint16_t kFuelRight[6] PROGMEM = {8400, 5400, 4600, 3350, 2200, 950};
-
-uint16_t ClusterCan::fuelCounts(float frac, bool right) const {
-  if (frac < 0.0f) frac = 0.0f;
-  if (frac > 1.0f) frac = 1.0f;
-  if (!cfg::FUEL_CURVE_REAL)
-    return (uint16_t)(frac * cfg::FUEL_TANK_L * cfg::FUEL_PER_LITRE);
-
-  uint16_t pm = (uint16_t)(frac * 1000.0f + 0.5f);
-  const uint16_t *tab = right ? kFuelRight : kFuelLeft;
-  for (uint8_t i = 0; i < 5; i++) {
-    uint16_t hiFrac = pgm_read_word(&kFuelFrac[i]);
-    uint16_t loFrac = pgm_read_word(&kFuelFrac[i + 1]);
-    if (pm > hiFrac || pm < loFrac) continue;
-    uint16_t hiCnt = pgm_read_word(&tab[i]);
-    uint16_t loCnt = pgm_read_word(&tab[i + 1]);
-    uint16_t span  = hiFrac - loFrac;
-    if (span == 0) return loCnt;
-    return (uint16_t)(loCnt + (uint32_t)(hiCnt - loCnt) * (pm - loFrac) / span);
-  }
-  return pgm_read_word(&tab[5]);
+void ClusterCan::setSymbol(uint16_t identifier, bool on) {
+    checkControl_.setCustomSymbol(identifier, on, bus_);
 }
 
-/* The level on the bus follows the setpoint at a tank's pace rather than
- * jumping. One keypress on the host moves the setpoint 5 litres at once and
- * the console's 'f' command can move it the whole tank; a real sender cannot
- * do that, and a step that size reads to the cluster as a refuelling event. */
-void ClusterCan::slewFuel(uint32_t now) {
-  float target = (float)fuelDl_ / 10.0f;
-  if (!cfg::FUEL_SLEW || fuelShown_ < 0.0f) {
-    fuelShown_  = target;
-    lastFuelMs_ = now;
-    return;
-  }
-  uint32_t dt = now - lastFuelMs_;
-  if (dt < 50) return;                      // float work at most 20x a second
-  lastFuelMs_ = now;
-  float step = cfg::FUEL_SLEW_FRAC_PER_S * cfg::FUEL_TANK_L * ((float)dt / 1000.0f);
-  float diff = target - fuelShown_;
-  if (diff > step)       fuelShown_ += step;
-  else if (diff < -step) fuelShown_ -= step;
-  else                   fuelShown_ = target;
+void ClusterCan::setCruise(uint8_t kmh) {
+    state_.setCruiseKmh(kmh);
 }
 
-// ============================================================================
-//  Scheduler: 10 ms tick. 0x0AA goes out on every even tick (20 ms); 0x1A6 on
-//  slots 7 and 17 (100 ms - see cfg::TICK_1A6_STEP: the cluster differentiates
-//  this frame, so sending it faster than the real cadence inflates the speed).
-//  Everything else sits in a numbered slot of the 200 ms (20 tick) cycle so no
-//  single tick ever carries more than two frames. An 8-byte frame at
-//  100 kbit/s occupies the bus for ~1.1 ms, so two per 10 ms tick is ~22% load.
-// ============================================================================
+void ClusterCan::setOdometerMode(OdometerMode mode) {
+    state_.setOdometerMode(mode);
+    distanceRemainder_ = 0.0f;
+}
+
+void ClusterCan::clearDriverRequests() {
+    setTractionLamps(false, false, false);
+    setWarnings(0);
+    setCruise(0);
+}
+
+// ---------------------------------------------------------------------------
+// Schedule
+// ---------------------------------------------------------------------------
+
 void ClusterCan::update() {
-  uint32_t now = millis();
-  if (now - lastTick_ < cfg::TX_TICK_MS) return;
-  lastTick_ = now;
-  tick_++;
+    const uint32_t now = millis();
+    if ((now - lastTickMs_) >= cfg::schedule::TickMs) {
+        lastTickMs_ = now;
+        ++tickCount_;
 
-  tickClock(now);
-  if (cfg::SEND_FUEL) slewFuel(now);
+        clock_.advanceTo(now);
+        if (cfg::send::Fuel) {
+            fuel_.update(state_.fuelLitres(), now);
+        }
 
-  if ((tick_ & 1) == 0) send0AA();               // every 20 ms, direct value
+        // Engine speed is read as a direct value, so a faster cadence than
+        // the rest of the schedule is accepted and keeps the needle smooth.
+        if ((tickCount_ % 2) == 0) {
+            sendEngineSpeed();
+        }
 
-  uint8_t slot = (uint8_t)(tick_ % 20);
-  switch (slot) {
-    case 0:  case 10: send130(); break;                 // 100 ms terminal status
-    case 1:  case 11: if (speedSrc_ & cfg::SPEED_SRC_1A0) send1A0(); break;
-    case 2:  case 12: if (cfg::SEND_LIGHTS) send21A(); break;   // 100 ms illumination
-    case 4:  case 14: if (cfg::SEND_BRAKE)  send1B4(); break;   // 100 ms handbrake
-    case 8:  case 18: if (speedSrc_ & cfg::SPEED_SRC_0CE) send0CE(); break;
-    case 7:  if (cfg::SEND_WARNING_SUPPRESS) send19E();
-             send1A6(); break;                          // 100 ms distance accumulator
-    case 17: if (cfg::SEND_DIMMER) send202();
-             send1A6(); break;                          // 100 ms distance accumulator
-    case 3:  send26E(); break;                          // 200 ms ignition
-    case 5:  if (cfg::SEND_COOLANT)          send1D0(); break;
-    case 6:  if (cfg::SEND_WARNING_SUPPRESS) send0C0(); break;
-    case 9:  if (cfg::SEND_FUEL)             send349(); break;
-    case 13: if (cfg::SEND_TURN)             send1F6(); break;
-    case 15: if (cfg::SEND_WARNING_SUPPRESS) send0D7(); break;
-    case 16: if (cfg::SEND_GEAR)             send1D2(); break;
-    case 19:
-      if (cfg::SEND_REVERSE)   send3B0();
-      if (cfg::SEND_LCD_LIGHT) send2C0();
-      break;
-    default: break;
-  }
-  // 0x34F is event driven in a real car: on a state change, plus a keepalive
-  // roughly every 5 s. The capture shows exactly that pattern (FD/FE bursts on
-  // the gear change, then one frame per 5 s while the state holds).
-  if (cfg::SEND_PARK_BRAKE && (handbrake_ != hb34F_ || (tick_ % 500) == 6)) {
-    hb34F_ = handbrake_;
-    send34F();
-  }
-  if (cfg::SEND_RANGE && (tick_ % 100) == 6) send366();  // 1 s
-
-  // Check-control symbols: one frame per 100 ms slot, so a burst of lamp
-  // changes spreads out over a few slots instead of flooding one tick.
-  if (cfg::SEND_SYMBOLS && (tick_ % 10) == 5) pumpSymbols();
-
-  // The clock, once anything has told us what time it is. Slots 3 and 13 carry
-  // one short frame each, so this never makes a tick carry a third.
-  if (cfg::SEND_CLOCK && clockValid_ && (tick_ % 10) == 3
-      && (uint32_t)(now - lastClock_) >= cfg::CLOCK_PERIOD_MS) {
-    lastClock_ = now;
-    send39E();
-  }
-  drainRx();
-}
-
-/* The cluster is not just a display - it talks back, and two of the frames it
- * broadcasts answer the questions a bench rig keeps asking:
- *
- *   0x2CA  the outside temperature it measures, B0 * 0.5 - 40 degC. This is
- *          read from a resistive sensor across KOMBI pins 4 and 5, NOT from
- *          the bus; with nothing wired there it pegs at the bottom of the
- *          scale, which is the famous "-40" on the on-board computer.
- *   0x2F8  its clock. Send 0x39E and this is how you see whether it took.
- *
- * Both are the cluster's own transmissions, so the jig only listens - see the
- * warning in Config.h about never transmitting them. */
-void ClusterCan::drainRx() {
-  can_frame f;
-  while (mcp_.readMessage(&f) == MCP2515::ERROR_OK) {
-    rx_ = rx_ + 1;
-    if (!cfg::REPORT_CLUSTER_RX) continue;
-    if (f.can_id == 0x2CA && f.can_dlc >= 1) {
-      // raw/2 - 40 degC, kept in tenths: AVR printf has no %f.
-      kombiTempRaw_   = f.data[0];
-      kombiTempDeciC_ = (int16_t)f.data[0] * 5 - 400;
-      kombiTempSeen_  = true;
-      kombiTempMs_    = millis();
-    } else if (f.can_id == 0x2F8 && f.can_dlc >= 3) {
-      kombiH_ = f.data[0];
-      kombiM_ = f.data[1];
-      kombiS_ = f.data[2];
-      kombiClockSeen_ = true;
-      kombiClockMs_   = millis();
+        serviceSlot(static_cast<uint8_t>(tickCount_ % cfg::schedule::SlotsPerCycle));
+        serviceAperiodic(now);
+        drainReceiveQueue();
     }
-  }
 }
 
-bool ClusterCan::send(uint32_t id, const uint8_t *data, uint8_t len) {
-  can_frame f;
-  memset(&f, 0, sizeof(f));
-  f.can_id  = id;
-  f.can_dlc = len;
-  memcpy(f.data, data, len);
-  bool ok = (mcp_.sendMessage(&f) == MCP2515::ERROR_OK);
-  if (ok) txOk_ = txOk_ + 1; else txFail_ = txFail_ + 1;
-  return ok;
-}
+void ClusterCan::serviceSlot(uint8_t slot) {
+    switch (slot) {
+        case cfg::schedule::SlotTerminalA:
+        case cfg::schedule::SlotTerminalB:
+            sendTerminalStatus();
+            break;
 
-uint16_t ClusterCan::speedRaw() const {
-  uint16_t raw = (uint16_t)((float)speedKmh_ / cfg::SPEED_KMH_PER_COUNT);
-  return raw > 0x0FFF ? 0x0FFF : raw;
-}
+        case cfg::schedule::SlotDynamicsSpeedA:
+        case cfg::schedule::SlotDynamicsSpeedB:
+            if (state_.usesSpeedSource(cfg::speed::SourceDynamics)) {
+                sendDynamicsSpeed();
+            }
+            break;
 
-// ============================================================================
-//  Frame builders
-// ============================================================================
+        case cfg::schedule::SlotLightsA:
+        case cfg::schedule::SlotLightsB:
+            if (cfg::send::Lights) {
+                sendLighting();
+            }
+            break;
 
-/* 0x130  Terminal status (CAS), 5 bytes, 100 ms
- *   B0 0x45 key status   B1 0x40 transponder   B2 0x21 terminal status (KL15 on)
- *   B3 0x8F steering lock/misc
- *   B4 packed counter + check nibble; bit 1 = IgnitionOn
- *
- * B4 is held CONSTANT. It is not a free-running counter you can drive on its
- * own: the high nibble is a sequence number and the low nibble is a check
- * value derived from it, so incrementing one without the other yields a byte
- * the cluster rejects. It then sees terminal status as implausible and re-runs
- * its power-on sequence (gong + every telltale) over and over. Both payloads
- * the community reports working on an E9x KOMBI keep B4 fixed - 0xFE from a
- * raw bus capture, 0xE2 from the e46canbus blog. */
-void ClusterCan::send130() {
-  uint8_t b4 = kl15_ ? cfg::T130_BYTE4_ON : cfg::T130_BYTE4_OFF;
-  if (cfg::T130_ROLLING_COUNTER && kl15_) {
-    b4 = (uint8_t)((cnt130_ << 4) | (b4 & 0x0F));
-    cnt130_ = (cnt130_ + 1) % 15;
-  }
-  uint8_t d[5] = {(uint8_t)(kl15_ ? 0x45 : 0x00), 0x40, 0x21, 0x8F, b4};
-  send(0x130, d, 5);
-}
+        case cfg::schedule::SlotBrakeA:
+        case cfg::schedule::SlotBrakeB:
+            if (cfg::send::Brake) {
+                sendBrake();
+            }
+            break;
 
-/* 0x26E  Ignition status, 8 bytes, 200 ms (static, from a working bench sketch) */
-void ClusterCan::send26E() {
-  const uint8_t d[8] = {0x40, 0x40, 0x7F, 0x50, 0xFF, 0xFF, 0xFF, 0xFF};
-  send(0x26E, d, 8);
-}
+        case cfg::schedule::SlotWheelSpeedA:
+        case cfg::schedule::SlotWheelSpeedB:
+            if (state_.usesSpeedSource(cfg::speed::SourceWheels)) {
+                sendWheelSpeeds();
+            }
+            break;
 
-/* 0x0AA  DME engine speed / pedal, 8 bytes, 20 ms  -> RPM NEEDLE
- *   B0 unknown (0xFE)   B1 0xF0 | counter 0..14 (DBC: Counter1 = B1 low nibble)
- *   B2..B3 accelerator pedal, 16-bit LE, 0.01 %/count (DBC AccelPedalPercentage)
- *   B4..B5 = RPM * 4, little endian
- *   B6 pedal/cruise flag bits: bit2 ThrottlePressed, bit4 AccelPedalPressed
- *   B7 0x99 */
-void ClusterCan::send0AA() {
-  uint16_t raw   = (uint16_t)rpm_ * 4;
-  uint16_t pedal = (uint16_t)pedalPct_ * 100;   // percent -> 0.01 % counts
-  uint8_t  b6    = 0xFE;
-  if (pedalPct_ == 0) b6 &= (uint8_t)~0x14;     // clear pressed bits at 0 %
-  uint8_t d[8] = {0xFE, (uint8_t)(0xF0 | cnt0AA_),
-                  (uint8_t)(pedal & 0xFF), (uint8_t)(pedal >> 8),
-                  (uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8), b6, 0x99};
-  cnt0AA_ = (cnt0AA_ + 1) % 15;
-  send(0x0AA, d, 8);
-}
+        case cfg::schedule::SlotDistanceA:
+            if (cfg::send::WarningSuppression) {
+                sendStabilityStatus();
+            }
+            sendDistance();
+            break;
 
-/* 0x1A6  Distance accumulator + time counter, 8 bytes, 100 ms  -> NEEDLE
- *   B0..B5 three copies of a 16-bit little-endian cumulative distance counter
- *   B6..B7 12-bit time counter, +400 per frame, B7 = 0xF0 | high nibble
- *
- * This is NOT a speed frame. Verified on a real E90 M3 capture (1154 frames):
- * the three words are independent accumulators climbing 0 -> 8793 while the
- * car does 0 -> 15.9 km/h, at 12.3..13.7 counts per km/h per second, and they
- * read 00 00 when parked. The old jig sent a CONSTANT speed word here; the
- * cluster differentiates the field, a constant differentiates to 0, and the
- * speedometer needle never moved while every direct-value gauge worked.
- *
- * B6..B7 is a separate free-running time counter: +400 per 100 ms frame
- * (mean delta 400.0 over all frames), wraps at 12 bits, B7 high nibble always
- * 0xF. The jig's old +1 per 20 ms was ~80x too slow.
- *
- * Cadence matters: sending this frame faster than 100 ms makes the derived
- * speed proportionally too fast, so it lives in scheduler slots 7 and 17. */
-void ClusterCan::send1A6() {
-  uint16_t kmh = speedKmh_;
+        case cfg::schedule::SlotDistanceB:
+            if (cfg::send::Dimmer) {
+                sendDimmer();
+            }
+            sendDistance();
+            break;
 
-  uint32_t now = millis();
-  uint32_t dtMs = now - lastDist_;
-  lastDist_ = now;
-  if (dtMs > 500) dtMs = 500;                 // first call / after a stall
+        case cfg::schedule::SlotIgnition:
+            sendIgnitionStatus();
+            break;
 
-  if (odoMode_ == cfg::ODO_DISTANCE && kmh) {
-    // counts = km/h * counts per km/h per second * seconds
-    distAccum_ += (float)kmh * cfg::ODO_COUNTS_PER_KMH_PER_SEC
-                  * ((float)dtMs / 1000.0f);
-    uint16_t whole = (uint16_t)distAccum_;
-    distAccum_ -= (float)whole;
-    dist1A6_ = (uint16_t)(dist1A6_ + whole);   // 16-bit wrap, like the car
-  } else if (odoMode_ == cfg::ODO_ALIVE) {
-    dist1A6_ = (uint16_t)(dist1A6_ + cfg::ODO_ALIVE_STEP);
-  }                                            // ODO_FROZEN: hold
+        case cfg::schedule::SlotCoolant:
+            if (cfg::send::Coolant) {
+                sendEngineTemperature();
+            }
+            break;
 
-  tick1A6_ = (uint16_t)(tick1A6_ + cfg::TICK_1A6_STEP);
-  uint8_t lo = dist1A6_ & 0xFF;
-  uint8_t hi = dist1A6_ >> 8;
+        case cfg::schedule::SlotAbsCounter:
+            if (cfg::send::WarningSuppression) {
+                sendAbsCounter();
+            }
+            break;
 
-  uint8_t d[8] = {lo, hi, lo, hi, lo, hi,
-                  (uint8_t)(tick1A6_ & 0xFF),
-                  (uint8_t)(0xF0 | ((tick1A6_ >> 8) & 0x0F))};
-  send(0x1A6, d, 8);
-}
+        case cfg::schedule::SlotFuel:
+            if (cfg::send::Fuel) {
+                sendFuelLevel();
+            }
+            break;
 
-/* 0x1A0  DSC vehicle dynamics / "Speed K-CAN", 8 bytes, 100 ms  -> NEEDLE
- *   B0..B1 12-bit V_VEH, 0.1 km/h per count, Intel order
- *          B1 low nibble = value high bits; B1 bits 4..6 = ST_VEH_DVCO
- *          (0 when V_VEH is 0, 1 once moving - verified over the capture);
- *          B1 bit 7 = 0x80 set in every real frame
- *   B2..B5 acceleration / yaw rate - sent as 0, which is what the working
- *          veikkos/e90-can-cluster driver sends and what the cluster accepts
- *   B6     low nibble = yaw high bits (0 with yaw 0); high nibble = ALIV_V,
- *          a time-based alive nibble: 5-6 steps per 100 ms frame in the
- *          capture, exactly what ((millis()%300)*16/300)&0x0F produces. NOT a
- *          per-frame +1: only 118 of 1157 real frames conform to that.
- *   B7     checksum, verified 1158/1158 on the capture:
- *            sum = 0x00A0 + B0+..+B6;  B7 = (sum + (sum>>8) + 0x01) & 0xFF
- *
- * Enabled by default (cfg::SPEED_SOURCES): real DSC sends this every 100 ms
- * alongside 0x1A6, and it carries the direct speed value the needle reads. */
-void ClusterCan::send1A0() {
-  uint16_t raw = (uint16_t)((float)speedKmh_ / cfg::SPEED_1A0_PER_COUNT);
-  if (raw > 0x0FFF) raw = 0x0FFF;
-  uint8_t st = raw ? 1 : 0;
-  uint8_t aliv = (uint8_t)(((millis() % 300) * 16 / 300) & 0x0F);
+        case cfg::schedule::SlotTurnSignals:
+            if (cfg::send::TurnSignals) {
+                sendTurnSignals();
+            }
+            break;
 
-  uint8_t d[8];
-  d[0] = (uint8_t)(raw & 0xFF);
-  d[1] = (uint8_t)(((raw >> 8) & 0x0F) | (st << 4) | 0x80);
-  d[2] = 0x00;                                  // acc_long
-  d[3] = 0x00;                                  // acc_long high | acc_lat low
-  d[4] = 0x00;                                  // acc_lat high
-  d[5] = 0x00;                                  // yaw rate
-  d[6] = (uint8_t)(aliv << 4);                  // yaw high | ALIV_V
-  uint16_t sum = 0x00A0;
-  for (uint8_t i = 0; i < 7; i++) sum = (uint16_t)(sum + d[i]);
-  d[7] = (uint8_t)(sum + (sum >> 8) + 0x01);
-  send(0x1A0, d, 8);
-}
+        case cfg::schedule::SlotAirbagCounter:
+            if (cfg::send::WarningSuppression) {
+                sendAirbagCounter();
+            }
+            break;
 
-/* 0x0CE  DSC wheel speeds, 8 bytes, 100 ms  -> alternative speed source
- * Four 16-bit little-endian wheel speeds (FL, FR, RL, RR), all sent equal.
- * Scaling and sign are capture-verified - see cfg::SPEED_0CE_PER_COUNT.
- * On by default now (cfg::SPEED_SOURCES). */
-void ClusterCan::send0CE() {
-  uint16_t raw = (uint16_t)((float)speedKmh_ / cfg::SPEED_0CE_PER_COUNT);
-  uint8_t lo = raw & 0xFF, hi = raw >> 8;
-  uint8_t d[8] = {lo, hi, lo, hi, lo, hi, lo, hi};
-  send(0x0CE, d, 8);
-}
+        case cfg::schedule::SlotGear:
+            if (cfg::send::Gear) {
+                sendGear();
+            }
+            break;
 
-/* 0x1B4  Brake / speed, 8 bytes, 100 ms  -> HANDBRAKE telltale
- *   B0..B1 12-bit speed (0.1-ish km/h/count) with B1 bits 14..15 = 0xC0
- *   B2 0xE2   B3 0xF0 | counter   B4 0x00
- *   B5 handbrake: 0x30 released, 0x32 engaged
- *   B6 0xFC released / 0xFE engaged   B7 counter
- *
- * Verified over 1154 real frames: B1 = 0xC0 in ALL of them (the 0xC0 pair are
- * static flag bits, not speed - they are set even with the car parked and the
- * speed field at 0), B2 = 0xE2 in ALL of them, and B6 tracks B5 exactly -
- * B5=0x30 always pairs with B6=0xFC (869 frames) and B5=0x32 with B6=0xFE
- * (245 frames). Sending B1 without 0xC0 means transmitting a speed signal the
- * car never sends.
- *
- * B5 has two independent confirmations: a bench capture uses 0x30, and the DBC
- * puts HandbrakeStatus1 at B5 with scaling (0.5, -24) - so 48 (0x30) decodes
- * to 0 "Disengaged" and 50 (0x32) to 1 "Engaged".
- *
- * B0..B1 here reads ~17% higher than 0x1A0's V_VEH at the same instant in the
- * capture (mean ratio 1.17 over 663 matched frame pairs), so they are two
- * different filtered signals - do not expect them to agree exactly. */
-void ClusterCan::send1B4() {
-  uint16_t raw = speedRaw();
-  uint8_t d[8] = {(uint8_t)(raw & 0xFF), (uint8_t)(0xC0 | ((raw >> 8) & 0x0F)),
-                  0xE2, (uint8_t)(0xF0 | cnt1B4_), 0x00,
-                  (uint8_t)(handbrake_ ? 0x32 : 0x30),
-                  (uint8_t)(handbrake_ ? 0xFE : 0xFC), cnt1B4_};
-  cnt1B4_ = (cnt1B4_ + 1) % 15;
-  send(0x1B4, d, 8);
-}
+        case cfg::schedule::SlotReverseAndLcd:
+            if (cfg::send::Reverse) {
+                sendReverse();
+            }
+            if (cfg::send::LcdLight) {
+                sendLcdIllumination();
+            }
+            break;
 
-/* 0x1D0  Engine data, 8 bytes, 100 ms
- *   B0 = coolant + 48 degC (DBC confirmed: EngineCoolantTemp = raw - 48)
- *   B1 = oil + 48 degC, same offset (veikkos driver + capture both)
- *   B2 = (alive & 0x0F) | engine_run_state << 4, state 0 off / 1 starting /
- *        2 running / 3 invalid
- *   B6/B7 static filler
- *
- * B2 used to be a raw byte counter, cnt1D0_++, so after 16 frames its upper
- * nibble - the engine state - started rolling through off / starting /
- * invalid for a quarter of every 256 frames while the cluster was being told
- * KL15 on and engine running. A cluster told that keeps gonging and lighting
- * the charge / oil / brake telltales (see cfg::ENGINE_IDLE_RPM), so the state
- * nibble has to be pinned and only the low nibble counted. */
-void ClusterCan::send1D0() {
-  int16_t oil = coolantC_ - 20;                  // capture runs ~20 C below coolant
-  if (oil < -48) oil = -48;
-  uint8_t state = engineOn_ ? 0x20 : 0x00;       // 0x02 << 4 = running
-  uint8_t d[8] = {(uint8_t)(coolantC_ + 48), (uint8_t)(oil + 48),
-                  (uint8_t)((cnt1D0_ = (cnt1D0_ + 1) & 0x0F) | state),
-                  0xFF, 0xFF, 0xFF, 0xCC, 0xFF};
-  send(0x1D0, d, 8);
-}
-
-/* 0x19E DSC status, 8 bytes, 200 ms
- *   B2 high nibble rotates (counter % 3), low nibble 0x03
- *   B3 0xFC   B4 0xCC   B5 0x00   B6 0x00
- *   B7 rolling counter
- *
- * This used to be a frozen payload {00 E0 B3 FC F0 43 00 65}: no counter
- * anywhere, so a DSC that never once changes its status frame reads as a dead
- * sender - and B5=0x43 appears in none of the 1154 real frames (real values
- * are 0x00, 0x41, 0x61, 0x40). The bytes here are the veikkos/e90-can-cluster
- * driver's, which is the one open-source payload proven to keep an E9x KOMBI
- * happy. The raw capture uses B2 low nibble 0x0F / B4 0xFE instead, so both
- * variants evidently pass - what neither does is stop counting. */
-void ClusterCan::send19E() {
-  uint8_t d[8] = {0x00, 0xE0, (uint8_t)(((cnt19E_ % 3) << 4) | 0x03),
-                  0xFC, 0xCC, 0x00, 0x00, cnt19E_++};
-  send(0x19E, d, 8);
-}
-
-/* 0x34F  Handbrake status, 2 bytes [OK]  -> PARK-BRAKE telltale + gong
- *   B0 0xFD released, 0xFE engaged      B1 0xFF
- * DLC 2 confirmed on the capture (22 frames: 20 x "FD FF" released while
- * driving, 2 x "FE FF" parked), and 0x1B4 B5/B6 says the same thing with a
- * different signal. Sent on change plus a 5 s keepalive - see update(). */
-void ClusterCan::send34F() {
-  uint8_t d[2] = {(uint8_t)(handbrake_ ? 0xFE : 0xFD), 0xFF};
-  send(0x34F, d, 2);
-}
-
-/* 0x0C0 ABS counter: B0 cycles 0xF0..0xFF, B1 0xFF */
-void ClusterCan::send0C0() {
-  uint8_t d[2] = {cnt0C0_, 0xFF};
-  cnt0C0_ = (cnt0C0_ == 0xFF) ? 0xF0 : cnt0C0_ + 1;
-  send(0x0C0, d, 2);
-}
-
-/* 0x0D7 airbag counter: B0 counter, B1 0xFF */
-void ClusterCan::send0D7() {
-  uint8_t d[2] = {cnt0D7_++, 0xFF};
-  send(0x0D7, d, 2);
-}
-
-/* 0x349  Fuel level, 5 bytes  -> FUEL GAUGE + low-fuel check control
- *   B0..B1 left sender counts, 16-bit LE    B2..B3 right sender counts
- *   B4 0x00
- *
- * DLC is 5, not 8 - that is the real frame length (the DBC gives 0x349 five
- * bytes: two 16-bit sensors at 0.00165108 gal/count, i.e. exactly 160
- * counts/litre). Sending DLC 8 makes the cluster discard the frame, so the
- * gauge stays dead and the low-fuel check-control warning keeps chiming.
- *
- * The two senders sit in the two halves of a saddle tank and do NOT share a
- * curve - see cfg::FUEL_CURVE_REAL. The level sent here is the slewed one, so
- * the gauge moves like a tank rather than teleporting when the host jumps. */
-void ClusterCan::send349() {
-  float litres = (fuelShown_ >= 0.0f) ? fuelShown_ : (float)fuelDl_ / 10.0f;
-  float frac   = litres / cfg::FUEL_TANK_L;
-  uint16_t l = fuelCounts(frac, false);
-  uint16_t r = fuelCounts(frac, true);
-  uint8_t d[5] = {(uint8_t)(l & 0xFF), (uint8_t)(l >> 8),
-                  (uint8_t)(r & 0xFF), (uint8_t)(r >> 8), 0x00};
-  send(0x349, d, 5);
-}
-
-/* 0x39E  Time and date, 8 bytes, 1 s  -> LCD CLOCK
- *   B0 hour  B1 minute  B2 second  B3 day
- *   B4 (month << 4) | 0x0F     B5..B6 year, 16-bit LE     B7 0xF2
- *
- * This is the frame that sets an E9x KOMBI's clock; the layout is the working
- * veikkos/e90-can-cluster one. A cluster that has never received it shows no
- * time at all, which on a bench is always the explanation for a blank clock -
- * there is no CAS, no iDrive and no GPS on the bench to have ever set it.
- * The cluster then broadcasts what it believes on 0x2F8, which drainRx()
- * reads back. */
-void ClusterCan::send39E() {
-  uint8_t d[8] = {hour_, min_, sec_, day_,
-                  (uint8_t)((month_ << 4) | 0x0F),
-                  (uint8_t)(year_ & 0xFF), (uint8_t)(year_ >> 8), 0xF2};
-  send(0x39E, d, 8);
-}
-
-/* 0x592  Check-control symbol, 8 bytes, event driven
- *   B0 0x40   B1..B2 symbol id, 16-bit LE   B3 0x31 show / 0x30 clear
- *   B4..B7 0xFF
- *
- * There is no "DSC lamp" signal on the K-CAN: the telltales that are not tied
- * to a frame of their own are numbered check-control symbols, and this is how
- * you raise and clear them. Ids live in cfg::sym. */
-void ClusterCan::send592(uint16_t id, bool on) {
-  uint8_t d[8] = {0x40, (uint8_t)(id & 0xFF), (uint8_t)(id >> 8),
-                  (uint8_t)(on ? 0x31 : 0x30), 0xFF, 0xFF, 0xFF, 0xFF};
-  send(0x592, d, 8);
-}
-
-/* Sends at most one 0x592 per call: whatever changed first, otherwise the
- * slot that is most overdue a refresh. A showing symbol is repeated every
- * cfg::SYM_ON_REFRESH_MS because that is what the real DSC does and because a
- * single frame lost to a bus error must not leave a lamp wrong; a cleared one
- * is re-cleared slowly for the same reason. The cursor walks round the slots
- * so one permanently-changing lamp cannot starve the others. */
-void ClusterCan::pumpSymbols() {
-  uint32_t now = millis();
-  for (uint8_t pass = 0; pass < 2; pass++) {
-    for (uint8_t i = 0; i < SYM_COUNT; i++) {
-      SymSlot &sl = sym_[(symCursor_ + i) % SYM_COUNT];
-      if (sl.id == 0) continue;
-      bool due;
-      if (pass == 0) {
-        due = (sl.want != sl.sent);         // a change: always first
-      } else {
-        uint16_t period = sl.want ? cfg::SYM_ON_REFRESH_MS
-                                  : cfg::SYM_OFF_REFRESH_MS;
-        due = (uint32_t)(now - sl.lastMs) >= period;
-      }
-      if (!due) continue;
-      send592(sl.id, sl.want);
-      sl.sent   = sl.want;
-      sl.lastMs = now;
-      symCursor_ = (uint8_t)((symCursor_ + i + 1) % SYM_COUNT);
-      return;
+        default:
+            break;
     }
-  }
 }
 
-/* 0x21A  FRM lighting status, 3 bytes, 100 ms  -> BACKLIGHT + light telltales
- * The bench-verified pair is B0=0x05 B1=0x10 B2=0x00 for lights on and
- * 00 00 00 for off. 0x05 is LIGHT_SIDE|LIGHT_LOW, so sending the mask
- * reproduces that payload exactly when both are set; the other bits are
- * inferred and may not map the way the names suggest. */
-void ClusterCan::send21A() {
-  bool on = lights_ != 0;
-  uint8_t d[3] = {lights_, (uint8_t)(on ? cfg::L21A_B1_ON : 0x00), 0x00};
-  send(0x21A, d, 3);
+void ClusterCan::serviceAperiodic(uint32_t nowMs) {
+    // The park brake frame is event driven in a vehicle: it is sent when the
+    // state changes, with an occasional repeat while it holds.
+    const bool parkBrakeChanged = (state_.handbrake() != lastParkBrakeSent_);
+    const bool parkBrakeRepeatDue =
+        (tickCount_ % cfg::schedule::TicksPer5Seconds) == cfg::schedule::PhaseParkBrake;
+    if (cfg::send::ParkBrake && (parkBrakeChanged || parkBrakeRepeatDue)) {
+        lastParkBrakeSent_ = state_.handbrake();
+        sendParkBrake();
+    }
+
+    if (cfg::send::Range &&
+        (tickCount_ % cfg::schedule::TicksPer1Second) == cfg::schedule::PhaseRange) {
+        sendTemperatureAndRange();
+    }
+
+    if (cfg::send::Cruise &&
+        (tickCount_ % cfg::schedule::SlotsPerCycle) == cfg::schedule::PhaseCruise) {
+        sendCruise();
+    }
+
+    // One symbol frame per 100 ms, so a burst of telltale changes is spread
+    // over successive slots rather than filling a single tick.
+    if (cfg::send::Symbols &&
+        (tickCount_ % cfg::schedule::TicksPer100Ms) == cfg::schedule::PhaseSymbols) {
+        checkControl_.service(bus_, nowMs);
+    }
+
+    const bool clockSlot =
+        (tickCount_ % cfg::schedule::TicksPer100Ms) == cfg::schedule::PhaseClock;
+    const bool clockDue = (nowMs - lastClockSendMs_) >= cfg::clock::SendPeriodMs;
+    if (cfg::send::Clock && clock_.isValid() && clockSlot && clockDue) {
+        lastClockSendMs_ = nowMs;
+        sendTimeAndDate();
+    }
 }
 
-/* 0x202  FRM dimmer status, 2 bytes [?] - layout is a guess: B0 = level.
- * The cluster computes final brightness from its own ambient phototransistor
- * combined with this dimmer signal, so expect limited effect on a bench until
- * that sensor is covered. */
-void ClusterCan::send202() {
-  uint8_t d[2] = {dimmer_, 0x00};
-  send(0x202, d, 2);
+void ClusterCan::drainReceiveQueue() {
+    CanMessage message;
+    while (bus_.receive(message)) {
+        if (cfg::feedback::Enabled) {
+            feedback_.consume(message, millis());
+        }
+    }
 }
 
-/* 0x2C0  FRM LCD illumination, 3 bytes [?] - same caveat as 0x202. */
-void ClusterCan::send2C0() {
-  uint8_t d[3] = {dimmer_, 0x00, 0x00};
-  send(0x2C0, d, 3);
+// ---------------------------------------------------------------------------
+// Frame builders
+// ---------------------------------------------------------------------------
+
+void ClusterCan::sendTerminalStatus() {
+    using namespace frame::terminal;
+
+    const bool on = state_.terminal15();
+    uint8_t packed = on ? PackedIgnitionOn : PackedIgnitionOff;
+    if (UseRollingCounter && on) {
+        packed = static_cast<uint8_t>((terminalCounter_ << frame::common::NibbleBits) |
+                                      (packed & frame::common::NibbleMask));
+        terminalCounter_ = nextCounter(terminalCounter_, frame::common::CounterModulus);
+    }
+
+    CanMessage message(cfg::canid::TerminalStatus, Length);
+    message[IndexKeyStatus] = on ? KeyPresent : KeyAbsent;
+    message[IndexTransponder] = Transponder;
+    message[IndexTerminalStatus] = TerminalStatus;
+    message[IndexSteeringLock] = SteeringLock;
+    message[IndexPacked] = packed;
+    bus_.send(message);
 }
 
-/* 0x1F6  Turn signals, 2 bytes  -> INDICATOR telltales + clicking
- *   B0 0x80 base | 0x10 left | 0x20 right | 0x01
- *   B1 0xF2 on the first frame of a new blink, 0xF1 while it continues
- * Derived from a bench capture (left 0x91/0xF2 then 0x91/0xF1, right swaps
- * 0x91 for 0xA1) and corroborated by the DBC, which puts TurnSignal_Left at
- * bit 4 and TurnSignal_Right at bit 5 - exactly the 0x10/0x20 difference. */
-void ClusterCan::send1F6() {
-  uint8_t t = turn_;
-  uint8_t b0 = 0x80;
-  if (t) b0 |= 0x01 | (uint8_t)((t & 0x01) ? 0x10 : 0) | (uint8_t)((t & 0x02) ? 0x20 : 0);
-  uint8_t b1 = t ? (uint8_t)((t != lastTurn_) ? 0xF2 : 0xF1) : 0xF0;
-  lastTurn_ = t;
-  uint8_t d[2] = {b0, b1};
-  send(0x1F6, d, 2);
+void ClusterCan::sendIgnitionStatus() {
+    CanMessage message(cfg::canid::IgnitionStatus, frame::ignition::Length);
+    for (uint8_t i = 0; i < frame::ignition::Length; ++i) {
+        message[i] = frame::ignition::Payload[i];
+    }
+    bus_.send(message);
 }
 
-/* 0x1D2  Gear display, 8 bytes [?]  -> P R N D and D1..D6 / S1..S6 / M1..M6
- *   B0 low nibble = ShiftLeverPosition (1=P 2=R 4=N 8=D), high nibble = its
- *      XOR complement; B1 high nibble = gear number (DBC "GearRelated_TBD");
- *   B3 high nibble = counter, bit2 = sport button; B4 low 2 bits = mode. */
-void ClusterCan::send1D2() {
-  uint8_t pos = gearPos_ & 0x0F;
-  uint8_t d[8] = {(uint8_t)(((~pos & 0x0F) << 4) | pos),
-                  (uint8_t)((gearNum_ << 4) | 0x0F),
-                  0xFF,
-                  (uint8_t)((cnt1D2_ << 4) | (gearMode_ == MODE_SPORT ? 0x04 : 0x00)),
-                  gearMode_, 0xFF, 0xFF, 0xFF};
-  cnt1D2_ = (cnt1D2_ + 1) % 15;
-  send(0x1D2, d, 8);
+void ClusterCan::sendEngineSpeed() {
+    using namespace frame::engineSpeed;
+
+    const uint16_t encodedSpeed = static_cast<uint16_t>(state_.engineSpeed() * SpeedScale);
+    const uint16_t encodedPedal = static_cast<uint16_t>(state_.pedalPercent() * PedalScale);
+
+    uint8_t flags = FlagsAllSet;
+    if (state_.pedalPercent() == 0) {
+        flags &= static_cast<uint8_t>(~FlagsPressedMask);
+    }
+
+    CanMessage message(cfg::canid::EngineSpeed, Length);
+    message[IndexUnknown] = UnknownValue;
+    message[IndexCounter] = static_cast<uint8_t>(CounterBase | engineSpeedCounter_);
+    message[IndexPedalLow] = lowByte16(encodedPedal);
+    message[IndexPedalHigh] = highByte16(encodedPedal);
+    message[IndexSpeedLow] = lowByte16(encodedSpeed);
+    message[IndexSpeedHigh] = highByte16(encodedSpeed);
+    message[IndexFlags] = flags;
+    message[IndexTrailer] = TrailerValue;
+
+    engineSpeedCounter_ = nextCounter(engineSpeedCounter_, frame::common::CounterModulus);
+    bus_.send(message);
 }
 
-/* 0x3B0  Reverse gear, 2 bytes [?] - DBC puts ReverseGear at bit 6 of B0. */
-void ClusterCan::send3B0() {
-  uint8_t d[2] = {(uint8_t)(reverse_ ? 0x40 : 0x00), 0xFF};
-  send(0x3B0, d, 2);
+void ClusterCan::advanceDistance(uint32_t nowMs) {
+    uint32_t elapsedMs = nowMs - lastDistanceMs_;
+    lastDistanceMs_ = nowMs;
+    if (elapsedMs > cfg::odometer::MaxIntegrationMs) {
+        elapsedMs = cfg::odometer::MaxIntegrationMs;
+    }
+
+    const uint16_t speed = state_.roadSpeed();
+    if (state_.odometerMode() == OdometerMode::Distance && speed > 0) {
+        const float seconds =
+            static_cast<float>(elapsedMs) / static_cast<float>(cfg::clock::MillisecondsPerSecond);
+        distanceRemainder_ +=
+            static_cast<float>(speed) * cfg::odometer::CountsPerKmhPerSecond * seconds;
+        const uint16_t whole = static_cast<uint16_t>(distanceRemainder_);
+        distanceRemainder_ -= static_cast<float>(whole);
+        // Allowed to wrap, as the counter does in a vehicle.
+        distanceCounter_ = static_cast<uint16_t>(distanceCounter_ + whole);
+    } else if (state_.odometerMode() == OdometerMode::Alive) {
+        distanceCounter_ = static_cast<uint16_t>(distanceCounter_ + cfg::odometer::AliveStep);
+    }
+
+    distanceTimeCounter_ =
+        static_cast<uint16_t>(distanceTimeCounter_ + cfg::odometer::TimeCounterStep);
 }
 
-/* 0x366  Outside temperature + remaining range, 4 bytes [?]
- *   B0 = (degC + 80) * 2        (DBC: factor 0.5, offset -80)
- *   B1..B2 = range in miles * 16 (DBC: factor 0.0625, unit miles)
- * The DBC lists KOMBI as the sender, meaning the cluster may measure outside
- * temperature itself - in which case this frame does nothing. Default off. */
-void ClusterCan::send366() {
-  uint16_t miles = (uint16_t)((uint32_t)rangeKm_ * 1000UL / 1609UL);
-  uint16_t rraw  = miles * 16;
-  uint8_t d[4] = {(uint8_t)((outsideC_ + 80) * 2),
-                  (uint8_t)(rraw & 0xFF), (uint8_t)(rraw >> 8), 0x00};
-  send(0x366, d, 4);
+void ClusterCan::sendDistance() {
+    using namespace frame::distance;
+
+    advanceDistance(millis());
+
+    const uint8_t low = lowByte16(distanceCounter_);
+    const uint8_t high = highByte16(distanceCounter_);
+
+    CanMessage message(cfg::canid::DistanceAccumulator, Length);
+    for (uint8_t copy = 0; copy < CopyCount; ++copy) {
+        const uint8_t base = static_cast<uint8_t>(IndexCopyFirst + copy * 2);
+        message[base] = low;
+        message[base + 1] = high;
+    }
+    message[IndexTimeLow] = lowByte16(distanceTimeCounter_);
+    message[IndexTimeHigh] = static_cast<uint8_t>(
+        TimeHighBase | ((distanceTimeCounter_ >> frame::common::ByteBits) &
+                        frame::common::NibbleMask));
+    bus_.send(message);
+}
+
+void ClusterCan::sendDynamicsSpeed() {
+    using namespace frame::dynamics;
+
+    uint16_t counts = static_cast<uint16_t>(static_cast<float>(state_.roadSpeed()) /
+                                            cfg::speed::DynamicsKmhPerCount);
+    if (counts > cfg::speed::TwelveBitMax) {
+        counts = cfg::speed::TwelveBitMax;
+    }
+
+    const uint8_t motion = (counts != 0) ? 1 : 0;
+    const uint8_t alive = static_cast<uint8_t>(
+        ((millis() % AlivePeriodMs) * AliveSteps / AlivePeriodMs) & frame::common::NibbleMask);
+
+    CanMessage message(cfg::canid::DynamicsSpeed, Length);
+    message[IndexSpeedLow] = lowByte16(counts);
+    message[IndexSpeedHigh] = static_cast<uint8_t>(
+        ((counts >> frame::common::ByteBits) & frame::common::NibbleMask) |
+        (motion << StatusShift) | AlwaysSetBit);
+    message[IndexAliveNibble] = static_cast<uint8_t>(alive << AliveShift);
+
+    uint16_t sum = ChecksumSeed;
+    for (uint8_t i = 0; i < ChecksumBytes; ++i) {
+        sum = static_cast<uint16_t>(sum + message[i]);
+    }
+    message[IndexChecksum] =
+        static_cast<uint8_t>(sum + (sum >> frame::common::ByteBits) + ChecksumFinalAdd);
+    bus_.send(message);
+}
+
+void ClusterCan::sendWheelSpeeds() {
+    using namespace frame::wheelSpeed;
+
+    const uint16_t counts = static_cast<uint16_t>(static_cast<float>(state_.roadSpeed()) /
+                                                  cfg::speed::WheelKmhPerCount);
+    CanMessage message(cfg::canid::WheelSpeeds, Length);
+    for (uint8_t wheel = 0; wheel < WheelCount; ++wheel) {
+        const uint8_t base = static_cast<uint8_t>(wheel * 2);
+        message[base] = lowByte16(counts);
+        message[base + 1] = highByte16(counts);
+    }
+    bus_.send(message);
+}
+
+uint16_t ClusterCan::brakeSpeedCounts() const {
+    uint16_t counts = static_cast<uint16_t>(static_cast<float>(state_.roadSpeed()) /
+                                            cfg::speed::BrakeKmhPerCount);
+    if (counts > cfg::speed::TwelveBitMax) {
+        counts = cfg::speed::TwelveBitMax;
+    }
+    return counts;
+}
+
+void ClusterCan::sendBrake() {
+    using namespace frame::brake;
+
+    const uint16_t counts = brakeSpeedCounts();
+    const bool engaged = state_.handbrake();
+
+    CanMessage message(cfg::canid::BrakeAndSpeed, Length);
+    message[IndexSpeedLow] = lowByte16(counts);
+    message[IndexSpeedHigh] = static_cast<uint8_t>(
+        SpeedHighFlags | ((counts >> frame::common::ByteBits) & frame::common::NibbleMask));
+    message[IndexConstant] = ConstantValue;
+    message[IndexCounterHigh] = static_cast<uint8_t>(CounterBase | brakeCounter_);
+    message[IndexSpare] = frame::common::Unused;
+    message[IndexHandbrake] = engaged ? HandbrakeEngaged : HandbrakeReleased;
+    message[IndexHandbrakeMirror] = engaged ? MirrorEngaged : MirrorReleased;
+    message[IndexCounter] = brakeCounter_;
+
+    brakeCounter_ = nextCounter(brakeCounter_, frame::common::CounterModulus);
+    bus_.send(message);
+}
+
+void ClusterCan::sendEngineTemperature() {
+    using namespace frame::engineTemperature;
+
+    int16_t oil = static_cast<int16_t>(state_.coolantCelsius() - OilBelowCoolant);
+    if (oil < -TemperatureOffset) {
+        oil = -TemperatureOffset;
+    }
+
+    engineTemperatureCounter_ =
+        static_cast<uint8_t>((engineTemperatureCounter_ + 1) & frame::common::NibbleMask);
+    const uint8_t runState = state_.engineRunning() ? StateRunning : StateStopped;
+
+    CanMessage message(cfg::canid::EngineTemperature, Length);
+    message[IndexCoolant] = static_cast<uint8_t>(state_.coolantCelsius() + TemperatureOffset);
+    message[IndexOil] = static_cast<uint8_t>(oil + TemperatureOffset);
+    message[IndexCounterAndState] =
+        static_cast<uint8_t>(engineTemperatureCounter_ | runState);
+    for (uint8_t i = IndexFillerFirst; i < Length; ++i) {
+        message[i] = frame::common::Filler;
+    }
+    message[IndexDistinctFiller] = DistinctFillerValue;
+    bus_.send(message);
+}
+
+void ClusterCan::sendStabilityStatus() {
+    using namespace frame::stability;
+
+    CanMessage message(cfg::canid::StabilityStatus, Length);
+    message[1] = Payload1;
+    message[IndexRotating] = static_cast<uint8_t>(
+        ((stabilityCounter_ % RotatingModulus) << frame::common::NibbleBits) |
+        RotatingLowNibble);
+    message[3] = Payload3;
+    message[4] = Payload4;
+    message[IndexCounter] = stabilityCounter_;
+
+    ++stabilityCounter_;
+    bus_.send(message);
+}
+
+void ClusterCan::sendParkBrake() {
+    CanMessage message(cfg::canid::ParkBrakeStatus, frame::parkBrake::Length);
+    message[0] = state_.handbrake() ? frame::parkBrake::Engaged : frame::parkBrake::Released;
+    message[1] = frame::common::Filler;
+    bus_.send(message);
+}
+
+void ClusterCan::sendAbsCounter() {
+    CanMessage message(cfg::canid::AbsCounter, frame::absCounter::Length);
+    message[0] = absCounter_;
+    message[1] = frame::common::Filler;
+
+    absCounter_ = (absCounter_ == frame::absCounter::Last)
+                      ? frame::absCounter::First
+                      : static_cast<uint8_t>(absCounter_ + 1);
+    bus_.send(message);
+}
+
+void ClusterCan::sendAirbagCounter() {
+    CanMessage message(cfg::canid::AirbagCounter, frame::airbagCounter::Length);
+    message[0] = airbagCounter_;
+    message[1] = frame::common::Filler;
+
+    ++airbagCounter_;
+    bus_.send(message);
+}
+
+void ClusterCan::sendFuelLevel() {
+    using namespace frame::fuelLevel;
+
+    const float litres = fuel_.displayedLitres(state_.fuelLitres());
+    const float fraction = litres / cfg::fuel::TankLitres;
+    const uint16_t left = FuelSender::counts(fraction, FuelSenderSide::Left);
+    const uint16_t right = FuelSender::counts(fraction, FuelSenderSide::Right);
+
+    CanMessage message(cfg::canid::FuelLevel, Length);
+    message[IndexLeftLow] = lowByte16(left);
+    message[IndexLeftHigh] = highByte16(left);
+    message[IndexRightLow] = lowByte16(right);
+    message[IndexRightHigh] = highByte16(right);
+    message[IndexSpare] = frame::common::Unused;
+    bus_.send(message);
+}
+
+void ClusterCan::sendTimeAndDate() {
+    using namespace frame::timeAndDate;
+
+    CanMessage message(cfg::canid::TimeAndDate, Length);
+    message[IndexHour] = clock_.hour();
+    message[IndexMinute] = clock_.minute();
+    message[IndexSecond] = clock_.second();
+    message[IndexDay] = clock_.day();
+    message[IndexMonth] =
+        static_cast<uint8_t>((clock_.month() << MonthShift) | MonthLowNibble);
+    message[IndexYearLow] = lowByte16(clock_.year());
+    message[IndexYearHigh] = highByte16(clock_.year());
+    message[IndexTrailer] = TrailerValue;
+    bus_.send(message);
+}
+
+void ClusterCan::sendLighting() {
+    using namespace frame::lighting;
+
+    const uint8_t mask = state_.lightMask();
+    CanMessage message(cfg::canid::LightingStatus, Length);
+    message[IndexMask] = mask;
+    message[IndexSecondary] = (mask != 0) ? SecondaryOn : SecondaryOff;
+    message[IndexSpare] = frame::common::Unused;
+    bus_.send(message);
+}
+
+void ClusterCan::sendDimmer() {
+    CanMessage message(cfg::canid::DimmerLevel, frame::dimmer::Length);
+    message[0] = state_.dimmer();
+    message[1] = frame::common::Unused;
+    bus_.send(message);
+}
+
+void ClusterCan::sendLcdIllumination() {
+    CanMessage message(cfg::canid::LcdIllumination, frame::lcdLight::Length);
+    message[0] = state_.dimmer();
+    message[1] = frame::common::Unused;
+    message[2] = frame::common::Unused;
+    bus_.send(message);
+}
+
+void ClusterCan::sendTurnSignals() {
+    using namespace frame::turnSignals;
+
+    const uint8_t bits = state_.turnSignalBits();
+    uint8_t encoded = Base;
+    if (bits != 0) {
+        encoded |= ActiveBit;
+        if ((bits & static_cast<uint8_t>(TurnSignal::Left)) != 0) {
+            encoded |= LeftBit;
+        }
+        if ((bits & static_cast<uint8_t>(TurnSignal::Right)) != 0) {
+            encoded |= RightBit;
+        }
+    }
+
+    CanMessage message(cfg::canid::TurnSignals, Length);
+    message[IndexState] = encoded;
+    message[IndexConstant] = ConstantValue;
+    bus_.send(message);
+}
+
+void ClusterCan::sendCruise() {
+    using namespace frame::cruise;
+
+    const bool active = state_.cruiseKmh() > 0;
+    cruiseTimer_ = static_cast<uint8_t>(cruiseTimer_ + TimerStep);
+
+    uint8_t setSpeed = SpeedWhenOff;
+    if (active) {
+        setSpeed = (state_.cruiseKmh() > cfg::limits::MaxCruiseKmh)
+                       ? cfg::limits::MaxCruiseKmh
+                       : state_.cruiseKmh();
+    }
+    const uint8_t changed = (setSpeed != lastCruiseSpeed_) ? ChangedFlag : ChangedNone;
+    lastCruiseSpeed_ = setSpeed;
+
+    CanMessage message(cfg::canid::CruiseControl, Length);
+    message[IndexTimer] = cruiseTimer_;
+    message[IndexSetSpeed] = setSpeed;
+    message[IndexStatus] = active ? StatusActiveKmh : StatusOff;
+    message[IndexAssistFlags] = frame::common::Unused;
+    message[IndexAssistExtra] = frame::common::Unused;
+    message[IndexEnableFlag] = active ? EnableActive : EnableOff;
+    message[IndexChanged] = changed;
+    message[IndexSpare] = frame::common::Unused;
+    bus_.send(message);
+}
+
+void ClusterCan::sendGear() {
+    using namespace frame::gear;
+
+    const uint8_t position =
+        static_cast<uint8_t>(state_.gearPosition()) & frame::common::NibbleMask;
+
+    CanMessage message(cfg::canid::GearDisplay, Length);
+    message[IndexPosition] = static_cast<uint8_t>(
+        ((~position & frame::common::NibbleMask) << frame::common::NibbleBits) | position);
+    message[IndexNumber] =
+        static_cast<uint8_t>((state_.gearNumber() << NumberShift) | NumberLowNibble);
+    message[IndexFiller] = frame::common::Filler;
+    message[IndexCounterAndSport] = static_cast<uint8_t>(
+        (gearCounter_ << CounterShift) |
+        ((state_.gearMode() == GearMode::Sport) ? SportBit : NoSport));
+    message[IndexMode] = static_cast<uint8_t>(state_.gearMode());
+    for (uint8_t i = IndexFillerFirst; i < Length; ++i) {
+        message[i] = frame::common::Filler;
+    }
+
+    gearCounter_ = nextCounter(gearCounter_, frame::common::CounterModulus);
+    bus_.send(message);
+}
+
+void ClusterCan::sendReverse() {
+    CanMessage message(cfg::canid::ReverseGear, frame::reverse::Length);
+    message[0] = state_.reverse() ? frame::reverse::Engaged : frame::reverse::Released;
+    message[1] = frame::common::Filler;
+    bus_.send(message);
+}
+
+void ClusterCan::sendTemperatureAndRange() {
+    using namespace frame::temperatureAndRange;
+
+    const uint16_t miles = static_cast<uint16_t>(
+        static_cast<uint32_t>(state_.rangeKm()) * MetresPerKilometre / MetresPerMile);
+    const uint16_t encodedRange = static_cast<uint16_t>(miles * RangeScale);
+
+    CanMessage message(cfg::canid::TemperatureAndRange, Length);
+    message[IndexTemperature] = static_cast<uint8_t>(
+        (state_.outsideCelsius() + TemperatureOffset) * TemperatureScale);
+    message[IndexRangeLow] = lowByte16(encodedRange);
+    message[IndexRangeHigh] = highByte16(encodedRange);
+    message[IndexSpare] = frame::common::Unused;
+    bus_.send(message);
 }

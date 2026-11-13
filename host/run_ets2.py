@@ -18,7 +18,7 @@ on Linux with nothing but g++:
 --source shm reads RenCloud's 32 kB layout instead, for a machine that
 already has that plugin installed.
 
-Same link as run.py: we push setpoints at 50 Hz and the firmware owns CAN
+Same link as run.py: setpoints are pushed at 50 Hz and the firmware owns CAN
 timing, so quitting here (or losing the game) never resets the cluster - it
 falls back to its own demo sweep after 1.5 s.
 """
@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--selftest", action="store_true",
                     help="check the struct layout and mapping, then exit")
     ap.add_argument("--probe", action="store_true",
-                    help="list what is in /dev/shm and which block we would use")
+                    help="list what is in /dev/shm and which block would be used")
     ap.add_argument("--setup", action="store_true",
                     help="find the Steam/ETS2 install, say where the plugin "
                          "goes and what would stop telemetry working")
@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                 frames += 1
                 status = _describe(sp)
                 live = True
-                # A plugin whose struct revision we do not mirror would feed
+                # A plugin whose struct revision is not mirrored here feeds
                 # plausible-looking nonsense, so say it once and loudly.
                 warn = getattr(source, "revid_warning", None)
                 if warn and warn != warned:
@@ -180,8 +180,8 @@ def main(argv: list[str] | None = None) -> int:
                 period = (1.0 if args.verbose else 2.0) if live else 5.0
                 next_status = now + period
                 live_prev = live
-                # The link only opens on the first frame we actually have to
-                # send, so before the game speaks we have not touched the port
+                # The link only opens on the first frame that has to be
+                # sent, so before the game responds the port is untouched
                 # at all - say that rather than crying "down".
                 if link is None:
                     link_state = "disabled"

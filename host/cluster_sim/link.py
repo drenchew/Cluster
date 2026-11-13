@@ -1,13 +1,13 @@
 """Serial link to the Arduino cluster driver.
 
 Wire format must stay byte-for-byte identical to ``struct HostState`` in
-``src/Protocol.h``:
+``include/HostProtocol.h``:
 
     0xAA 0x55  <len=28>  <28 payload bytes>  <xor over len+payload>
 
 The firmware owns CAN timing. We only push setpoints; if this process dies the
 Arduino keeps the 0x130 heartbeat running and falls back to its own demo sweep,
-so the cluster never resets just because the GUI closed.
+so the cluster does not reset when the interface is closed.
 """
 
 from __future__ import annotations
@@ -28,18 +28,18 @@ SYNC1 = 0x55
 
 # rpm, speed, fuelDl, coolantC, outsideC, rangeKm,
 # flags, lights, turn, gearPos, gearNum, gearMode, dimmer, pedalPct,
-# flags2, hour, minute, second, day, month, year
-_FMT = "<HHHhhHBBBBBBBBBBBBBBH"
+# flags2, hour, minute, second, day, month, year, warn, cruiseKmh
+_FMT = "<HHHhhHBBBBBBBBBBBBBBHBB"
 PAYLOAD_LEN = struct.calcsize(_FMT)
-assert PAYLOAD_LEN == 28, PAYLOAD_LEN
+assert PAYLOAD_LEN == 30, PAYLOAD_LEN
 
-# HostFlags in src/Protocol.h
+# HostFlag in include/HostProtocol.h
 HF_KL15 = 0x01
 HF_ENGINE = 0x02
 HF_HANDBRAKE = 0x04
 HF_REVERSE = 0x08
 
-# HostFlags2 in src/Protocol.h. These three drive check-control symbols on
+# HostExtraFlag in include/HostProtocol.h. These three drive check-control symbols on
 # 0x592 rather than bits in a telltale frame - the E9x cluster has no "light
 # the DSC lamp" signal, so a numbered symbol is raised and cleared instead.
 HF2_TC_LAMP = 0x01       # "DTC" traction-mode lamp
@@ -47,14 +47,26 @@ HF2_DSC_LAMP = 0x02      # DSC triangle - flashed while actually intervening
 HF2_DSC_OFF = 0x04       # DSC switched off, solid
 HF2_CLOCK = 0x08         # the clock fields are valid
 
-# cfg::LIGHT_* in include/Config.h
+# cfg::warn in include/Config.h. Like the traction lamps these are
+# check-control symbols on 0x592, not telltale bits - the cluster has no
+# "light the check engine lamp" signal, so a numbered symbol is raised.
+WARN_CHECK_ENGINE = 0x01
+WARN_OIL = 0x02
+WARN_BATTERY = 0x04
+WARN_COOLANT = 0x08
+WARN_FUEL = 0x10
+WARN_ADBLUE = 0x20
+WARN_BRAKE = 0x40
+WARN_TYRE = 0x80
+
+# cfg::lights in include/Config.h
 LIGHT_SIDE = 0x01
 LIGHT_HIGH = 0x02
 LIGHT_LOW = 0x04
 LIGHT_FOGF = 0x20
 LIGHT_FOGR = 0x40
 
-# GearPos in src/ClusterCan.h
+# GearPosition in include/VehicleState.h
 GEAR_OFF, GEAR_P, GEAR_R, GEAR_N, GEAR_D = 0, 1, 2, 4, 8
 MODE_NORMAL, MODE_SPORT, MODE_MANUAL = 0, 1, 2
 
@@ -86,6 +98,16 @@ class Setpoints:
     tc_lamp: bool = False      # traction mode (DTC) enabled
     dsc_lamp: bool = False     # intervening right now; flash this yourself
     dsc_off: bool = False      # stability control switched off
+
+    # ---- warning lamps ------------------------------------------------------
+    # A WARN_* bitmask. The firmware spreads the resulting 0x592 frames over
+    # successive 100 ms slots, so setting several at once is free here.
+    warn: int = 0
+
+    # ---- cruise control -----------------------------------------------------
+    # Set speed in km/h on 0x193; 0 means cruise is off and the telltale goes
+    # out. The cluster shows the number itself, so there is nothing to format.
+    cruise_kmh: int = 0
 
     # ---- clock -------------------------------------------------------------
     # None leaves the cluster's clock alone (the firmware keeps running
@@ -139,6 +161,8 @@ class Setpoints:
             _clamp(day, 1, 31),
             _clamp(month, 1, 12),
             _clamp(year, 2000, 2200),
+            self.warn & 0xFF,
+            _clamp(self.cruise_kmh, 0, 250),
         )
         checksum = PAYLOAD_LEN
         for b in payload:
@@ -154,7 +178,7 @@ def _clamp(v, lo, hi) -> int:
 class Clock:
     """The fields ``Setpoints.clock`` needs, from whatever source.
 
-    ``datetime.datetime`` already has these attributes, so the sim just passes
+    ``datetime.datetime`` already provides these attributes, so the simulator passes
     one; this exists for the game clock, which is a count of in-game minutes
     and has no datetime to offer.
     """

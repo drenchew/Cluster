@@ -13,7 +13,7 @@
 
     * **Fuelling, not throttle, sets the combustion level.** On the overrun the
       injectors stop, so the combustion layer drops away and what is left is
-      mechanical - which is exactly how a diesel hollows out when you lift.
+      mechanical, reproducing how a diesel hollows out on a lifted throttle.
     * **Boost drives the turbo whine**, so it spools up and bleeds off with the
       real lag instead of tracking the pedal instantly.
     * **Wastegate dump** on a lift at boost.
@@ -168,7 +168,7 @@ class _StreamEngine:
         self._cur_boost += (self._boost - self._cur_boost) * min(1.0, dt / 0.04)
         self._cur_fuel += (self._fuelling - self._cur_fuel) * min(1.0, dt / 0.03)
         self._cur_speed += (self._speed - self._cur_speed) * min(1.0, dt / 0.08)
-        # Pops follow their target almost immediately - the whole point is
+        # Pops follow their target almost immediately, because the effect is
         # that they are abrupt.
         self._cur_pop += (self._pop - self._cur_pop) * min(1.0, dt / 0.01)
         g0 = self._cur_gain

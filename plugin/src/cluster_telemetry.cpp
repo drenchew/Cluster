@@ -1,21 +1,23 @@
-/*
- * cluster_telemetry.cpp - ETS2/ATS telemetry plugin for the BMW E9x cluster rig.
+/**
+ * @file cluster_telemetry.cpp
+ * @brief Telemetry plugin for Euro Truck Simulator 2 and American Truck
+ *        Simulator.
  *
- * The game loads this as bin/linux_x64/plugins/cluster-telemetry.so, and it
- * publishes a 512 byte snapshot of the truck into /dev/shm/ClusterTelemetry
- * once per simulation frame. host/cluster_sim/ets2_plugin.py picks it up and
- * the existing mapping turns it into CAN frames.
+ * The game loads this shared object from its plugins directory and publishes
+ * a fixed size snapshot of the simulated vehicle into POSIX shared memory once
+ * per simulation frame. The host application reads that block and converts it
+ * into the CAN frames the instrument cluster expects.
  *
- * Why a plugin of our own rather than RenCloud's: that project's layout is a
- * 32 kB struct covering trailers, jobs and gameplay events, published by a
- * Windows-first codebase whose Linux support lives in a fork. The cluster
- * needs about thirty numbers. A small block we define ourselves is one file
- * to keep in step with the Python instead of a whole struct to mirror, and it
- * builds here with nothing but g++.
+ * Design note. The established community plugin publishes a 32 kB structure
+ * covering trailers, jobs and gameplay events, and its Linux support lives in
+ * a fork built with CMake. This driver requires roughly thirty values, so a
+ * small block defined alongside the reader is both easier to keep consistent
+ * and builds with a compiler alone.
  *
- * Threading: every SDK callback arrives on the game's simulation thread, so
- * the staging copy needs no locking. The only cross-process concern is a
- * reader catching a half-written frame, which the seqlock in publish() closes.
+ * Concurrency. Every callback from the simulator arrives on its simulation
+ * thread, so the staging copy needs no locking. The only cross process
+ * concern is a reader observing a partially written block, which the sequence
+ * lock in publish() prevents.
  */
 
 #include <cerrno>
@@ -77,12 +79,11 @@ void log_line(const scs_log_type_t type, const char *const fmt, ...)
 /* ---------------------------------------------------------------------- */
 
 /*
- * Each channel is registered with its destination as the context pointer, so
- * these four functions cover every channel we want. All of them are
- * registered with FLAG_no_value, which means the game calls us with a null
- * value when a channel has nothing to report - a truck that has just been
- * despawned, or a load screen. Zeroing on null is what keeps the gauges from
- * freezing at the last value they saw before the menu.
+ * Each channel is registered with the address of its destination as the
+ * context pointer, so these four functions cover every channel. All are
+ * registered with FLAG_no_value, so the simulator passes a null value when a
+ * channel has nothing to report, such as during a loading screen. Clearing
+ * the field in that case prevents a gauge from holding the last value it saw.
  */
 
 SCSAPI_VOID store_float(const scs_string_t /*name*/, const scs_u32_t /*index*/,
@@ -113,10 +114,9 @@ SCSAPI_VOID store_u32(const scs_string_t /*name*/, const scs_u32_t /*index*/,
     *dst = (value && value->type == SCS_VALUE_TYPE_u32) ? value->value_u32.value : 0u;
 }
 
-/* For a channel the game publishes as u32 that we keep as a signed field,
-   because every other gear-ish number here is signed. truck.hshifter.slot is
-   the one that does this; registering it as s32 is refused outright with
-   "type 2 is not supported by channel". */
+/* Stores a channel published as an unsigned value into a signed field, used
+   for the shifter slot so that it matches the other gear related members.
+   Registering that channel as signed is rejected by the simulator. */
 SCSAPI_VOID store_u32_as_s32(const scs_string_t /*name*/, const scs_u32_t /*index*/,
                              const scs_value_t *const value, const scs_context_t context)
 {
@@ -138,9 +138,14 @@ void publish()
 
     g_state.frames++;
 
-    /* Fields ahead of seq - magic, version, size - are written once at init
-       and must survive, so the copy starts after seq rather than clobbering
-       the lock we are holding. */
+    /* There is no "cruise is engaged" channel - the SDK publishes the set
+       speed and leaves it at zero when cruise is off - so the flag is
+       derived here rather than left for every reader to work out. */
+    g_state.cruise_control_on = (g_state.cruise_control > 0.1f) ? 1u : 0u;
+
+    /* The fields preceding seq are written once during initialisation and
+       must be preserved, so the copy begins after the sequence counter
+       rather than overwriting the lock currently held. */
     const size_t head = offsetof(cluster_shm_t, seq) + sizeof(uint32_t);
 
     __atomic_store_n(&g_shm->seq, ++g_seq, __ATOMIC_RELEASE); /* odd: writing */
@@ -251,16 +256,15 @@ SCSAPI_VOID event_configuration(const scs_event_t /*event*/, const void *const e
 /* ---------------------------------------------------------------------- */
 
 /*
- * Which block to publish. Normally the one name the host looks for, but
- * CLUSTER_SHM_NAME in the environment overrides it, which is what lets the
- * test harness run while a game is playing: the harness loads this very
- * library and its shutdown unlinks whatever it opened, so sharing a name
- * with a live game would delete that game's block out from under it.
+ * Selects the shared memory object to publish. The default is the name the
+ * host reads. An override through the environment allows the test harness to
+ * run while a game is in progress: the harness loads this same library, and
+ * its shutdown unlinks whatever object it opened, so a shared name would
+ * remove the running game's block.
  *
- * Only a plain "/name" is accepted - no embedded slashes, nothing that could
- * wander out of the shm namespace - and anything else falls back to the
- * default rather than failing, since a typo here should cost the override,
- * not the telemetry.
+ * Only a plain "/name" is accepted. A malformed value falls back to the
+ * default rather than failing, so that a mistake costs the override and not
+ * the telemetry itself.
  */
 const char *shm_name()
 {
@@ -276,9 +280,9 @@ const char *shm_name()
     return env;
 }
 
-/* Remembered for shutdown: getenv could in principle change underneath us,
-   and unlinking a different name than we created would leave the block
-   behind for ever. */
+/* Retained for shutdown. The environment could change during execution, and
+   unlinking a different name than the one created would leave the original
+   object in place indefinitely. */
 const char *g_shm_name = CLUSTER_SHM_NAME;
 
 bool open_shm()
@@ -427,8 +431,7 @@ void register_channels(const scs_telemetry_init_params_v100_t *const p)
      * for channel". Stopping at the first refusal keeps the array at 16 for
      * the host's benefit while asking only for what this build has, and
      * adapts by itself if a later patch moves the cap. It costs one error
-     * line in game.log.txt at startup, which is the game telling us where
-     * the edge is. */
+     * message in the game log at startup, which reports the limit. */
     for (scs_u32_t i = 0; i < CLUSTER_WHEELS; ++i) {
         if (REG_I(p, SCS_TELEMETRY_TRUCK_CHANNEL_wheel_velocity, i, SCS_VALUE_TYPE_float,
                   store_float, wheel_angular_velocity[i]) != SCS_RESULT_ok) {

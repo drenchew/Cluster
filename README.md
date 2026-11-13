@@ -62,6 +62,10 @@ o 0|1|2  0x1A6 distance accumulator: frozen / alive / distance
 x 0..3   extra speed frames: +1 = 0x1A0, +2 = 0x0CE (both on by default)
 w 1435   set the clock, HHMM or HHMMSS       (0x39E)
 u 0..7   traction lamps: +1 DTC, +2 DSC triangle, +4 DSC off  (0x592)
+m 0..255 warning lamps, one bit each (0x592):
+           1 check engine    2 oil       4 battery   8 coolant temp
+          16 fuel reserve   32 AdBlue   64 brake   128 tyre pressure
+v 0..250 cruise control set speed in km/h, 0 = off  (0x193)
 y 357 1  raise (1) or clear (0) any check-control symbol by id (0x592)
 d        resume demo sweep  ?       print state
 ```
@@ -77,7 +81,7 @@ kombi: outside 10.5C clock 14:32:07
 That line comes from 0x2CA and 0x2F8, which the KOMBI transmits — see
 [The on-board computer](#the-on-board-computer-temperature-and-clock).
 
-### If the speedometer needle will not move
+### Diagnosing a stationary speedometer needle
 
 The speedometer was the one thing on this jig that never responded, and the
 reason is now pinned down: **0x1A6 bytes 0–5 are not a speed value.** They are
@@ -396,7 +400,7 @@ They get resampled and crossfaded by rpm. Force the choice with
 Truck Simulator) with no game-side hardware and no new wire protocol: it reads
 the game's shared memory and pushes the usual 50 Hz setpoints at `link.py`.
 
-### Just drive
+### Running the ETS2 bridge
 
 ```sh
 ./drive.sh
@@ -622,6 +626,14 @@ not producing telemetry.
 | `truck.gameThrottle` | pedal readout in the telemetry rail |
 | `truck.wheelVelocity × wheelRadius` vs `truck.speed` | driven-wheel slip → flashing DSC triangle, 0x592 |
 | `truck.differentialLock` | `DTC` lamp — the game's own traction aid, 0x592 |
+| `truck.wear.engine` > 0.55 | check engine lamp, 0x592 — the game has no MIL channel, so engine wear stands in |
+| `truck.oil.pressure.warning` | oil lamp, 0x592 |
+| `truck.battery.voltage.warning` | battery lamp, 0x592 |
+| `truck.water.temperature.warning` | coolant temperature lamp, 0x592 |
+| `truck.fuel.warning` | fuel reserve lamp, 0x592 |
+| `truck.adblue.warning` | AdBlue lamp, 0x592 |
+| `truck.brake.air.pressure.warning` | red brake lamp, 0x592 — a truck losing air is the nearest thing the E9x has |
+| `truck.cruise_control` | cruise telltale + set speed, 0x193 |
 | `common.time_abs` (in-game minutes) | the clock, 0x39E (`--clock game|system|off`) |
 
 Three of those are deliberate compromises:
@@ -633,7 +645,25 @@ Three of those are deliberate compromises:
   (`ClusterCan.cpp`), so below idle the needle simply sits at 800.
 - **Blinker *enable*, not lamp.** `truck.lblinker` is the logical switch and
   `truck.light.lblinker` is the 2 Hz lamp state. Feeding the lamp would
-  re-kick the cluster's own 0x1F6 flasher every frame.
+  re-kick the cluster's own 0x1F6 flasher every frame. The same reasoning
+  applies inside the frame — see below.
+
+#### Indicator flash timing
+
+0x1F6 byte 1 was once driven from a bench capture that showed `0xF2` on the
+frame where the stalk moved and `0xF1` on the frames after it, which read
+naturally as "new blink" and "continuing". Sending it that way makes the
+indicators stutter: **the cluster runs its own blink timer**, and a byte 1
+that changes underneath it restarts or re-phases that timer instead of
+leaving it alone, so the lamp never settles into the steady ~1 Hz of a real
+car.
+
+It now sends a full 8-byte frame with byte 1 held at a constant `0xF0`, which
+is what `veikkos/e90-can-cluster` does on the same KOMBI, and byte 0 carrying
+the whole state — `0x91` left, `0xA1` right, `0xB1` hazards, `0x80` off. The
+rule is the same one as for the host: anything that *looks* like timing
+information belongs to the cluster, and the jig should only ever say what the
+stalk is doing.
 
 Traction control has no switch in the game, so the lamps report what the truck
 is doing instead of what a driver selected. `wheel_slip()` measures the worst
@@ -641,6 +671,51 @@ powered wheel's surface speed against ground speed — the way a real DSC does,
 rather than guessing from the throttle — and anything past 8% slip under power
 flashes the triangle. The in-game date is not a real one, so only the hour and
 minute come from the game; the date comes from the PC.
+
+### Warning lamps and cruise control
+
+Warning lamps are check-control symbols on 0x592, the same mechanism as the
+traction lamps — the E9x cluster has no "light the check engine lamp" signal,
+so a numbered symbol is raised and cleared instead. The host sends a
+`cfg::WARN_*` bitmask and the firmware spreads the resulting frames over
+successive 100 ms slots, so raising eight lamps at once costs eight slots
+rather than flooding one tick.
+
+| bit | lamp | symbol id | from the game |
+|---|---|---|---|
+| 0x01 | check engine | 31 | `truck.wear.engine` > 0.55 |
+| 0x02 | oil | 212 | `truck.oil.pressure.warning` |
+| 0x04 | battery | 213 | `truck.battery.voltage.warning` |
+| 0x08 | coolant temperature | 39 | `truck.water.temperature.warning` |
+| 0x10 | fuel reserve | 275 | `truck.fuel.warning` |
+| 0x20 | AdBlue | 643 | `truck.adblue.warning` |
+| 0x40 | brake, red | 308 | `truck.brake.air.pressure.warning` |
+| 0x80 | tyre pressure | 50 | unused — the game has no tyre pressure |
+
+The ids are cross-checked against the `ErrorLightID` enum in
+`veikkos/e90-can-cluster`, which drives the same cluster, rather than read off
+the symbol PDF. **ETS2 has no check-engine channel at all**, so that lamp
+stands in for a worn engine — the condition the game does model.
+
+Cruise control is 0x193, every 200 ms:
+
+```
+B0  rolling timer, +17 per frame - the cluster ignores a frame that is not moving
+B1  set speed km/h, 0xFE when off
+B2  0xF4 active (km/h), 0xF5 would be mph, 0xF1 off
+B3  ACC: 0x10 yellow car, 0x20 foot-on-brake      (unused here)
+B4  ACC: 0x01 red car blinking                    (unused here)
+B5  0x58 active, 0x50 off
+B6  0x01 on the frame where the set speed changed
+B7  0
+```
+
+The DBC attributes 0x193 to the KOMBI, which would make it a frame to listen
+to rather than send — but the cluster clearly receives it too, and a bench run
+with it enabled gave **1977 frames with 0 TX failures**, so there is no
+contention in practice. `cfg::SEND_CRUISE` turns it off if a particular
+cluster disagrees, and the `tx`/`fail` counters in the 5 s status line are
+where that would show.
 
 ### When the game goes quiet
 
@@ -650,6 +725,60 @@ alt-tabbed replay). Nothing is sent, the firmware's 1.5 s host watchdog trips,
 and the cluster drops into its own demo sweep — it never resets and never
 holds a stale value. Same story on Ctrl-C: `run_ets2.py` closes the link and
 the jig carries on by itself.
+
+## Firmware architecture
+
+The firmware is organised as a small set of classes, each responsible for one
+part of the problem. The intent is that any one of them can be read and
+understood without reading the others.
+
+```
+Application            constructs everything and owns the main loop
+ +- Mcp2515Bus         ICanBus implementation for the CAN controller
+ +- ClusterCan         transmission schedule and frame encoding
+ |   +- VehicleState   the values being displayed, and their limits
+ |   +- TimeOfDay      clock and calendar
+ |   +- FuelSender     gauge damping and the sender curves
+ |   +- CheckControl   numbered warning symbols
+ |   +- ClusterFeedback  what the cluster reports back
+ +- HostProtocol       binary setpoint link to the host
+ +- DemoSweep          local pattern when no host is present
+ +- SerialConsole      typed commands
+```
+
+The design decisions worth noting:
+
+**The driver depends on an interface, not on hardware.** `ClusterCan` holds an
+`ICanBus &` and never names the MCP2515. `Mcp2515Bus` implements that
+interface for the real controller, and the test harness supplies a recording
+implementation instead. This is what allows the entire transmission schedule
+to be exercised on a workstation: the harness compiles every source file
+except the hardware driver, substitutes its own bus, and prints the frames
+that would have been sent.
+
+**Validation lives with the data.** `VehicleState` holds every setpoint behind
+accessors so that range limits and interdependent rules are enforced in one
+place. The most important of those rules is that engine speed cannot fall
+below idle while the engine is marked as running, because a cluster reading
+zero with the ignition on treats the engine as stalled.
+
+**Protocol constants are declared, not written inline.** `FrameLayout.h`
+records the byte positions and fixed values of each frame, with the evidence
+for the layout alongside, so the builders in `ClusterCan` read as a
+description of the protocol.
+
+**Ownership of timing is explicit.** The firmware runs the schedule from its
+own tick regardless of what the host is doing. Losing the serial link cannot
+stop the bus, which is why closing the host application never resets the
+cluster.
+
+### Verifying a change
+
+The behaviour of the frame schedule is covered by a comparison test rather
+than by inspection. A harness drives the driver through a fixed scenario with
+simulated time and records every frame; the recording is compared against one
+taken before the change, and must match byte for byte. The restructuring of
+this firmware into the classes above was verified that way across 2795 frames.
 
 ## Frames
 
@@ -665,7 +794,8 @@ group defaults to *off* in `include/Config.h`. Enable those one at a time.
 | 0x1B4 | 100 ms | speed + handbrake (B5: 0x30 off, 0x32 on; B1 `0xC0`, B2 `0xE2`) | OK |
 | 0x34F | event + 5 s | handbrake status, DLC 2: `FD FF` released / `FE FF` on | OK |
 | 0x21A | 100 ms | illumination / backlight + light telltales | OK |
-| 0x1F6 | 200 ms | turn signals | OK |
+| 0x1F6 | 200 ms | turn signals (B0 0x91/0xA1/0xB1, B1 constant 0xF0, 8 bytes) | OK |
+| 0x193 | 200 ms | cruise control telltale + set speed | OK |
 | 0x26E | 200 ms | ignition status | OK |
 | 0x1D0 | 200 ms | coolant temperature (B0 = degC + 48) | OK |
 | 0x349 | 200 ms | fuel level, DLC 5, two non-linear senders | OK |
@@ -673,7 +803,7 @@ group defaults to *off* in `include/Config.h`. Enable those one at a time.
 | 0x1A0 | 100 ms | "Speed K-CAN" — direct speed, **on by default** | OK |
 | 0x0CE | 100 ms | DSC wheel speeds — four signed 16-bit LE, **on by default** | OK |
 | 0x39E | 1 s | time + date — **sets the cluster clock** | OK |
-| 0x592 | event + 200 ms | check-control symbol by id: DTC / DSC / DSC OFF | OK |
+| 0x592 | event + 200 ms | check-control symbol by id: traction lamps, check engine, oil, battery, coolant, fuel, AdBlue, brake, tyre | OK |
 | 0x1D2 | 200 ms | gear display P R N D, D1..D6 | ? |
 | 0x202 / 0x2C0 | 200 ms | dimmer level / LCD illumination | ? |
 | 0x3B0 | 200 ms | reverse gear | ? |
@@ -687,7 +817,7 @@ Received, never transmitted — these are the cluster's own:
 | 0x2F8 | its clock: `hour, minute, second, day, month<<4, year LE` |
 
 
-### Four things that will bite you if you change them
+### Constraints that must be preserved
 
 **0x130 byte 4 must stay constant.** Its high nibble is a sequence number and
 its low nibble a check value derived from it, so incrementing one alone yields
@@ -755,11 +885,23 @@ right integrator.
 ## Layout
 
 ```
-include/Config.h          every tunable, with confidence notes per frame group
-src/ClusterCan.{h,cpp}    frame builders + 10 ms TX scheduler
-src/Protocol.{h,cpp}      binary host link + host-timeout watchdog
-src/Demo.{h,cpp}          local sweep when no host is connected
-src/main.cpp              wiring, text console
+include/Config.h          every tunable, grouped by subsystem
+include/FrameLayout.h     wire format of each CAN frame
+include/ICanBus.h         bus interface the driver is written against
+include/Mcp2515Bus.h      the hardware implementation of that interface
+include/CanMessage.h      value type for one CAN frame
+include/VehicleState.h    the setpoints, with their validation rules
+include/TimeOfDay.h       clock and calendar
+include/FuelSender.h      fuel gauge damping and sender curves
+include/CheckControl.h    numbered warning symbols
+include/ClusterFeedback.h what the cluster reports about itself
+include/ClusterCan.h      schedule and frame encoding
+include/HostProtocol.h    binary host link and its frame format
+include/DemoSweep.h       local sweep when no host is connected
+include/SerialConsole.h   typed command interface
+include/Application.h     composition root
+src/*.cpp                 one implementation file per header
+src/main.cpp              Arduino entry points only
 E90_Cluster/              standalone ESP32 sketch (older: no clock, symbols
                           or fuel curve - the Uno build is the current one)
 drive.sh                  one command: fix whatever is broken, then drive
@@ -767,7 +909,7 @@ host/run.py               simulator entry point
 host/run_ets2.py          ETS2 / ATS entry point
 host/ambient_resistor.py  temperature <-> resistor for the pins 4-5 NTC
 
-host/cluster_sim/link.py        serial framing, must match src/Protocol.h
+host/cluster_sim/link.py        serial framing, must match include/HostProtocol.h
 host/cluster_sim/vehicle.py     engine, turbo, gearbox, driveline, chassis
 host/cluster_sim/audio.py       engine synthesis + sample back end
 host/cluster_sim/gauges.py      dials, needles, glow, telltale icons
@@ -781,10 +923,10 @@ plugin/test/host_test.cpp         loads the .so and drives it with no game
 plugin/scs_sdk/                   official SCS SDK 1.16 headers, MIT, vendored
 ```
 
-The wire format is `0xAA 0x55 <len=28> <28 bytes> <xor>`, little-endian. The
-layout lives in `struct HostState` (`src/Protocol.h`) and `_FMT`
+The wire format is `0xAA 0x55 <len=30> <30 bytes> <xor>`, little-endian. The
+layout lives in `struct HostState` (`include/HostProtocol.h`) and `_FMT`
 (`host/cluster_sim/link.py`); a `static_assert` fails the firmware build if
-the struct ever stops matching `cfg::HOST_PAYLOAD`.
+the struct ever stops matching `cfg::host::PayloadBytes`.
 
 ## Sources
 
