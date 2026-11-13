@@ -101,6 +101,9 @@ private:
     /// Advances the distance accumulator for one 0x1A6 frame.
     void advanceDistance(uint32_t nowMs);
 
+    /// Advances the injected fuel accumulator for one 0x1D0 frame.
+    void advanceInjection(uint32_t nowMs);
+
     void sendTerminalStatus();
     void sendIgnitionStatus();
     void sendEngineSpeed();
@@ -150,6 +153,12 @@ private:
     /// Last park brake state placed on the bus, so the frame can be sent on
     /// change as a vehicle does rather than continuously.
     bool lastParkBrakeSent_ = false;
+
+    /// Cumulative injected fuel reported in 0x1D0, with the fractional part
+    /// carried between frames so that a low demand still accumulates.
+    uint16_t injectionCounter_ = 0;
+    float injectionRemainder_ = 0.0f;
+    uint32_t lastInjectionMs_ = 0;
 
     // 0x1A6 accumulator state.
     uint16_t distanceCounter_ = 0;

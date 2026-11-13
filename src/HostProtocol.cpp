@@ -108,6 +108,7 @@ void HostProtocol::apply(ClusterCan &cluster) {
     state.setDimmer(frame.dimmer);
     state.setTurnSignal((frame.turnSignals & TurnLeftBit) != 0,
                         (frame.turnSignals & TurnRightBit) != 0);
+    state.setConsumptionPercent(frame.consumptionPercent);
     state.setGear(static_cast<GearPosition>(frame.gearPosition), frame.gearNumber,
                   static_cast<GearMode>(frame.gearMode));
 

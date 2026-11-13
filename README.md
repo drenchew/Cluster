@@ -410,7 +410,8 @@ python3 run_sysmon.py --selftest      # mapping checks
 |---|---|---|
 | speedometer | network download rate | `--max-mbit`, default 100 Mbit/s, maps to 260 km/h |
 | tachometer | memory in use | 5500 rpm, the diesel redline |
-| fuel gauge | processor load | `--fuel-floor-l` (default 15 l) at idle up to a full tank |
+| consumption gauge | processor load | 0 to 100 percent demand |
+| fuel gauge | free filesystem space | a full tank is an empty disk |
 | coolant gauge | processor temperature | degrees Celsius, passed through unchanged |
 | clock | the host clock | |
 
@@ -430,24 +431,38 @@ most measure the chassis or a chipset.
 
 ### Three things this mode has to get right
 
-**The fuel gauge must not be taken down to empty.** The cluster raises its own
-low fuel warning from the level it is sent on 0x349, independently of anything
-the host asks for; on an E9x the reserve warning appears at about 8 litres of
-60. Mapping processor load from an empty tank therefore lights the reserve
-telltale and sounds the chime whenever the machine is merely idle — and
-because the cluster raised that warning itself, the host cannot clear it.
+**Processor load belongs on the consumption gauge, not the fuel gauge.** The
+cluster raises its own low fuel warning from the level it is sent on 0x349,
+independently of anything the host asks for; on an E9x the reserve warning
+appears at about 8 litres of 60. Load on the fuel gauge therefore lit the
+reserve telltale and sounded the chime whenever the machine was merely idle,
+and a warning the cluster raised itself cannot be cleared from here.
 
-Load is instead mapped onto the range from `--fuel-floor-l` to a full tank,
-15 litres by default. That leaves a margin over the 8 litre threshold for the
-non-linear sender curve and for whatever hysteresis the cluster applies, at
-the cost of the lowest quarter of the dial. The self test sweeps load from 0
-to 100 percent and asserts that the level never reaches the warning.
+The consumption gauge has no warning at either end of its range, so load goes
+there instead. It is driven by **0x1D0 bytes 4 and 5**, a cumulative count of
+injected fuel which the cluster differentiates — the same principle as the
+distance accumulator in 0x1A6, and with the same consequence: what matters is
+the rate of climb, so the increment is scaled by the elapsed interval and the
+reading does not change if the schedule does. The fractional part is carried
+between frames, without which a demand of one percent would never move the
+counter at all. On higher trim clusters this is a separate needle; on others
+the same value appears on the multi function display.
 
-For the same reason the fuel reserve symbol is not used for anything here.
-The gauge beside it already means processor load, so a reserve telltale would
-appear to refer to that gauge, and the symbol belongs to the cluster. Memory
-pressure uses the tyre pressure symbol instead: it is free, because no tyre
-pressure data is transmitted, and it reads as a pressure warning.
+Free filesystem space takes the fuel gauge, which is the one quantity where
+the cluster's own warning is useful rather than a nuisance: a tank approaching
+empty then means a disk approaching full. `--fuel-floor-l` raises the bottom
+of the range to suppress it; the default of zero leaves it as a genuine low
+disk alarm.
+
+The fuel reserve symbol is not assigned to anything here, since it is the
+cluster's to raise. Memory pressure uses the tyre pressure symbol instead: it
+is free, because no tyre pressure data is transmitted, and it reads as a
+pressure warning.
+
+Measured against the real driver: demand of 25, 50 and 100 percent produces
+150, 300 and 600 counts per second, exactly proportional; zero demand does not
+move the counter; one percent for twenty seconds accumulates 121 counts; and
+the counter keeps climbing after it wraps.
 
 **Needles need smoothing, gauges need none.** A download rate measured over a
 tenth of a second varies far more than the quantity being displayed, so the
@@ -1013,7 +1028,7 @@ plugin/test/host_test.cpp         loads the .so and drives it with no game
 plugin/scs_sdk/                   official SCS SDK 1.16 headers, MIT, vendored
 ```
 
-The wire format is `0xAA 0x55 <len=30> <30 bytes> <xor>`, little-endian. The
+The wire format is `0xAA 0x55 <len=31> <31 bytes> <xor>`, little-endian. The
 layout lives in `struct HostState` (`include/HostProtocol.h`) and `_FMT`
 (`host/cluster_sim/link.py`); a `static_assert` fails the firmware build if
 the struct ever stops matching `cfg::host::PayloadBytes`.

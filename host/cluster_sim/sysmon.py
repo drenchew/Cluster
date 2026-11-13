@@ -2,10 +2,11 @@
 
 The cluster becomes a system monitor:
 
-    speedometer     network download rate
-    tachometer      memory in use
-    fuel gauge      processor load
-    coolant gauge   processor temperature
+    speedometer       network download rate
+    tachometer        memory in use
+    consumption gauge processor load
+    fuel gauge        free space on the filesystem
+    coolant gauge     processor temperature
 
 Everything is read from ``/proc`` and ``/sys``, so the only dependency is the
 same ``pyserial`` the rest of the host tooling needs.
@@ -128,6 +129,8 @@ class Reading:
     cpu_load: float = 0.0           # 0..1 across all cores
     cpu_celsius: float | None = None
     memory_total_bytes: int = 0
+    disk_free: float = 0.0          # 0..1 of the filesystem
+    disk_total_bytes: int = 0
 
 
 @dataclass
@@ -145,7 +148,9 @@ class SystemMetrics:
     """
 
     def __init__(self, interfaces: list[str] | None = None,
-                 temperature_path: str | None = None):
+                 temperature_path: str | None = None,
+                 disk_path: str = "/"):
+        self._disk_path = disk_path
         self._interfaces = interfaces if interfaces else default_interfaces()
         self._temperature_path = (
             temperature_path if temperature_path is not None else find_cpu_temperature_path())
@@ -223,6 +228,25 @@ class SystemMetrics:
                     transmitted += int(fields[8])
         return received, transmitted
 
+    def _disk(self) -> tuple[float, int]:
+        """(fraction free, total bytes) for the chosen filesystem.
+
+        Uses the blocks available to an unprivileged user rather than the
+        total free blocks, which is what the filesystem will actually let a
+        program write and therefore what "space left" means in practice.
+        """
+        free = 0.0
+        total = 0
+        try:
+            stats = os.statvfs(self._disk_path)
+            total = stats.f_blocks * stats.f_frsize
+            if total > 0:
+                free = max(0.0, min(1.0,
+                                    (stats.f_bavail * stats.f_frsize) / total))
+        except OSError:
+            pass
+        return free, total
+
     def _temperature(self) -> float | None:
         value = None
         if self._temperature_path is not None:
@@ -255,12 +279,15 @@ class SystemMetrics:
                 # is treated as no traffic rather than a vast burst.
                 down = max(0, received - self._last_net[0]) / elapsed
                 up = max(0, transmitted - self._last_net[1]) / elapsed
+                disk_free, disk_total = self._disk()
                 reading = Reading(download_bytes_per_s=down,
                                   upload_bytes_per_s=up,
                                   memory_used=used,
                                   cpu_load=load,
                                   cpu_celsius=self._temperature(),
-                                  memory_total_bytes=total)
+                                  memory_total_bytes=total,
+                                  disk_free=disk_free,
+                                  disk_total_bytes=disk_total)
 
         self._last_net = (received, transmitted)
         self._last_time = now
@@ -284,25 +311,21 @@ class MapOptions:
     # The diesel tachometer reads to 5500 rpm.
     max_rpm: int = 5500
 
-    # The fuel gauge is calibrated in litres by the firmware, so processor load
-    # is expressed as a fraction of this tank size.
+    # Processor load goes to the consumption gauge, which has no warning at
+    # either end of its range. The firmware converts this demand figure into
+    # the cumulative injected-fuel count the cluster differentiates.
+    max_consumption_percent: int = 100
+
+    # The fuel gauge shows free space on the filesystem, which is the one
+    # quantity where the cluster's own low level warning is useful rather than
+    # a nuisance: a tank approaching empty then means a disk approaching full.
+    # The reserve warning appears near 8 litres of 60, so it fires at roughly
+    # 13 percent free.
     tank_litres: float = 60.0
 
-    # Processor load is mapped onto the range [fuel_floor_litres, tank_litres]
-    # rather than from empty.
-    #
-    # The cluster raises its own low fuel warning from the level on 0x349,
-    # independently of anything this host asks for: on an E9x the reserve
-    # warning appears at about 8 litres of 60. Mapping load from an empty tank
-    # would therefore light the reserve telltale and sound the chime whenever
-    # the machine was merely idle, which is both wrong and impossible to
-    # silence from here. Starting the range above that threshold avoids the
-    # warning entirely at the cost of the lowest quarter of the dial.
-    #
-    # 15 litres leaves a margin over the 8 litre threshold for the non-linear
-    # sender curve and for whatever hysteresis the cluster applies. Lower it
-    # if the needle on a particular cluster stays clear of the warning.
-    fuel_floor_litres: float = 15.0
+    # Raise this to keep the needle clear of that warning, at the cost of the
+    # bottom of the dial. Zero allows the warning to act as a low disk alarm.
+    fuel_floor_litres: float = 0.0
 
     # Processor temperature goes to the coolant gauge unchanged, since both are
     # temperatures in degrees Celsius. A machine with no readable sensor shows
@@ -391,8 +414,13 @@ class Mapper:
         sp = lk.Setpoints()
         sp.speed_kmh = int(round(download * opt.max_speed_kmh))
         sp.rpm = int(round(memory * opt.max_rpm))
+        # Processor load drives the consumption gauge.
+        sp.consumption_pct = int(round(cpu * opt.max_consumption_percent))
+
+        # Free filesystem space drives the fuel gauge: a full tank means an
+        # empty disk.
         usable = max(0.0, opt.tank_litres - opt.fuel_floor_litres)
-        sp.fuel_l = opt.fuel_floor_litres + cpu * usable
+        sp.fuel_l = opt.fuel_floor_litres + _clamp_unit(reading.disk_free) * usable
         sp.coolant_c = int(round(celsius))
 
         # The gauge must not be damped here. The firmware models a real tank
@@ -441,9 +469,10 @@ def describe(reading: Reading, sp: lk.Setpoints, opt: MapOptions) -> str:
     temperature = ("%.0fC" % reading.cpu_celsius) if reading.cpu_celsius is not None else "--"
     return (f"down {down_mbit:7.2f} Mbit/s -> {sp.speed_kmh:3d} km/h   "
             f"ram {reading.memory_used * 100:5.1f}% -> {sp.rpm:4d} rpm   "
-            f"cpu {reading.cpu_load * 100:5.1f}% -> {sp.fuel_l:4.1f} l   "
+            f"cpu {reading.cpu_load * 100:5.1f}% -> {sp.consumption_pct:3d}%   "
+            f"disk {reading.disk_free * 100:4.1f}% free -> {sp.fuel_l:4.1f} l   "
             f"temp {temperature} -> {sp.coolant_c:3d}C   "
-            f"up {up_mbit:6.2f} Mbit/s   warn 0x{sp.warn:02X}")
+            f"up {up_mbit:5.2f} Mbit/s   warn 0x{sp.warn:02X}")
 
 
 # ---------------------------------------------------------------------------
@@ -463,29 +492,31 @@ def selftest() -> None:
 
     full_scale = opt.max_download_mbit * BITS_PER_MEGABIT / BITS_PER_BYTE
 
-    # Half the rated download, half the memory, a quarter of the processor.
+    # Half the rated download, half the memory, a quarter of the processor,
+    # three quarters of the filesystem free.
     half = Reading(download_bytes_per_s=full_scale / 2,
-                   memory_used=0.5, cpu_load=0.25, cpu_celsius=55.0)
+                   memory_used=0.5, cpu_load=0.25, cpu_celsius=55.0,
+                   disk_free=0.75)
     sp = mapper.to_setpoints(half, now=0.0)
     assert sp.speed_kmh == 130, sp.speed_kmh
     assert sp.rpm == 2750, sp.rpm
-    # A quarter load sits a quarter of the way up the usable range, which
-    # starts at the floor rather than at empty.
-    expected = opt.fuel_floor_litres + 0.25 * (opt.tank_litres - opt.fuel_floor_litres)
-    assert abs(sp.fuel_l - expected) < 0.01, (sp.fuel_l, expected)
+    assert sp.consumption_pct == 25, sp.consumption_pct
+    assert abs(sp.fuel_l - 45.0) < 0.01, sp.fuel_l
     assert sp.coolant_c == 55, sp.coolant_c
     assert sp.warn == 0, hex(sp.warn)
-    assert sp.fuel_direct, "load on the fuel gauge requires the damping off"
+    assert sp.fuel_direct, "the gauge shows a measurement, not a tank level"
     assert sp.kl15 and sp.engine, "the cluster must see a running engine"
 
     # Full scale on every dial, and a link faster than the rated speed must
     # peg the needle rather than wrap around.
     mapper = Mapper(opt)
     loaded = Reading(download_bytes_per_s=full_scale * 4,
-                     memory_used=1.0, cpu_load=1.0, cpu_celsius=95.0)
+                     memory_used=1.0, cpu_load=1.0, cpu_celsius=95.0,
+                     disk_free=1.0)
     sp = mapper.to_setpoints(loaded, now=0.0)
     assert sp.speed_kmh == opt.max_speed_kmh, sp.speed_kmh
     assert sp.rpm == opt.max_rpm, sp.rpm
+    assert sp.consumption_pct == opt.max_consumption_percent, sp.consumption_pct
     assert abs(sp.fuel_l - opt.tank_litres) < 0.01, sp.fuel_l
     assert sp.warn & lk.WARN_CHECK_ENGINE
     assert sp.warn & lk.WARN_TYRE, "memory pressure uses the tyre symbol"
@@ -493,23 +524,30 @@ def selftest() -> None:
     assert not (sp.warn & lk.WARN_FUEL), \
         "the reserve symbol belongs to the cluster, not to this mapping"
 
-    # An idle machine sits at the bottom of every dial, except that the fuel
-    # gauge stops short of the cluster's own reserve warning.
+    # An idle machine sits at the bottom of the needles it drives.
     mapper = Mapper(opt)
-    idle = Reading(cpu_celsius=40.0)
+    idle = Reading(cpu_celsius=40.0, disk_free=0.5)
     sp = mapper.to_setpoints(idle, now=0.0)
     assert sp.speed_kmh == 0 and sp.rpm == 0, (sp.speed_kmh, sp.rpm)
-    assert abs(sp.fuel_l - opt.fuel_floor_litres) < 0.01, sp.fuel_l
+    assert sp.consumption_pct == 0, sp.consumption_pct
 
-    # The whole point of the floor: no processor load, however low, may put
-    # the needle into reserve, because the cluster would raise a warning this
-    # host has no way to clear.
+    # Processor load must never reach the fuel gauge, whatever it does. That
+    # is the whole reason it moved to the consumption gauge: the cluster
+    # raises its own reserve warning from the fuel level, and this host has no
+    # way to clear a warning the cluster raised itself.
     for percent in range(0, 101):
         level = mapper.to_setpoints(
-            Reading(cpu_load=percent / 100.0, cpu_celsius=40.0), now=0.0).fuel_l
-        assert level > RESERVE_WARNING_LITRES, (percent, level)
-    assert mapper.to_setpoints(
-        Reading(cpu_load=1.0, cpu_celsius=40.0), now=0.0).fuel_l <= opt.tank_litres
+            Reading(cpu_load=percent / 100.0, disk_free=0.5, cpu_celsius=40.0),
+            now=0.0).fuel_l
+        assert abs(level - 30.0) < 0.01, (percent, level)
+
+    # The fuel gauge follows the filesystem, and a nearly full disk is allowed
+    # to reach the reserve warning, where it means something.
+    mapper = Mapper(opt)
+    roomy = mapper.to_setpoints(Reading(disk_free=0.9, cpu_celsius=40.0), now=0.0)
+    cramped = mapper.to_setpoints(Reading(disk_free=0.05, cpu_celsius=40.0), now=0.0)
+    assert roomy.fuel_l > RESERVE_WARNING_LITRES, roomy.fuel_l
+    assert cramped.fuel_l < RESERVE_WARNING_LITRES, cramped.fuel_l
 
     # A machine with no temperature sensor must not read as frozen.
     mapper = Mapper(opt)
@@ -538,7 +576,8 @@ def selftest() -> None:
     assert second.download_bytes_per_s == 0.0
 
     assert "down" in describe(half, sp, opt)
-    print("sysmon selftest OK  (mapping, full scale, idle, smoothing, missing sensors)")
+    print("sysmon selftest OK  (mapping, full scale, idle, smoothing, "
+          "disk, missing sensors)")
 
 
 def main(argv: list[str] | None = None) -> int:

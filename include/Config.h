@@ -224,6 +224,24 @@ constexpr float SlewFractionPerSecond = 0.015f;
 constexpr uint32_t SlewIntervalMs = 50;
 }  // namespace fuel
 
+/// 0x1D0 bytes 4 and 5 carry a cumulative count of injected fuel, which the
+/// cluster differentiates to drive its instant consumption reading. On higher
+/// trim variants that reading is a separate needle; on others it appears on
+/// the multi function display.
+///
+/// Because the value is differentiated, the result depends on the rate of
+/// accumulation and therefore on the transmission interval, exactly as the
+/// distance accumulator does. The increment below is per 100 ms of elapsed
+/// time, and the frame builder scales it by the actual interval so that the
+/// reading does not change if the schedule does.
+namespace consumption {
+constexpr uint8_t MaxPercent = 100;
+/// Counts added per 100 ms at full demand. Calibrated on hardware: raise it
+/// if the needle reads low across its range, lower it if it pegs.
+constexpr float CountsPerPercentPer100Ms = 0.6f;
+constexpr uint32_t ReferenceIntervalMs = 100;
+}  // namespace consumption
+
 /// 0x39E time and date. A cluster that has never received this frame displays
 /// no clock at all.
 namespace clock {
@@ -310,7 +328,7 @@ namespace host {
 constexpr uint32_t TimeoutMs = 1500;
 constexpr uint8_t SyncFirst = 0xAA;
 constexpr uint8_t SyncSecond = 0x55;
-constexpr uint8_t PayloadBytes = 30;   ///< must equal sizeof(HostState)
+constexpr uint8_t PayloadBytes = 31;   ///< must equal sizeof(HostState)
 }  // namespace host
 
 /// Local demonstration sweep, active only while no host is connected.

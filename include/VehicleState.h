@@ -68,6 +68,10 @@ public:
     void setReverse(bool engaged);
     void setGear(GearPosition position, uint8_t number, GearMode mode);
     void setCruiseKmh(uint8_t kmh);
+
+    /// Instantaneous fuel demand, 0 to 100 percent, shown on the
+    /// consumption gauge.
+    void setConsumptionPercent(uint8_t percent);
     void setWarningMask(uint8_t mask);
     void setOdometerMode(OdometerMode mode);
     void setSpeedSources(uint8_t mask);
@@ -94,6 +98,7 @@ public:
     uint8_t gearNumber() const;
     GearMode gearMode() const;
     uint8_t cruiseKmh() const;
+    uint8_t consumptionPercent() const;
     uint8_t warningMask() const;
     OdometerMode odometerMode() const;
     uint8_t speedSources() const;
@@ -123,6 +128,7 @@ private:
     uint8_t gearNumber_ = 0;
     GearMode gearMode_ = GearMode::Normal;
     uint8_t cruiseKmh_ = 0;
+    uint8_t consumptionPercent_ = 0;
     uint8_t warningMask_ = 0;
     OdometerMode odometerMode_ = OdometerMode::Distance;
     uint8_t speedSources_ = cfg::speed::DefaultSources;

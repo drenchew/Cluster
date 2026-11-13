@@ -454,6 +454,25 @@ void ClusterCan::sendBrake() {
     bus_.send(message);
 }
 
+void ClusterCan::advanceInjection(uint32_t nowMs) {
+    uint32_t elapsedMs = nowMs - lastInjectionMs_;
+    lastInjectionMs_ = nowMs;
+    // Clamped for the same reason as the distance accumulator: the first call
+    // after power-up would otherwise charge the whole uptime to one frame.
+    if (elapsedMs > cfg::odometer::MaxIntegrationMs) {
+        elapsedMs = cfg::odometer::MaxIntegrationMs;
+    }
+
+    const float intervals = static_cast<float>(elapsedMs) /
+                            static_cast<float>(cfg::consumption::ReferenceIntervalMs);
+    injectionRemainder_ += static_cast<float>(state_.consumptionPercent()) *
+                           cfg::consumption::CountsPerPercentPer100Ms * intervals;
+    const uint16_t whole = static_cast<uint16_t>(injectionRemainder_);
+    injectionRemainder_ -= static_cast<float>(whole);
+    // Allowed to wrap, as the counter in a vehicle does.
+    injectionCounter_ = static_cast<uint16_t>(injectionCounter_ + whole);
+}
+
 void ClusterCan::sendEngineTemperature() {
     using namespace frame::engineTemperature;
 
@@ -465,6 +484,7 @@ void ClusterCan::sendEngineTemperature() {
     engineTemperatureCounter_ =
         static_cast<uint8_t>((engineTemperatureCounter_ + 1) & frame::common::NibbleMask);
     const uint8_t runState = state_.engineRunning() ? StateRunning : StateStopped;
+    advanceInjection(millis());
 
     CanMessage message(cfg::canid::EngineTemperature, Length);
     message[IndexCoolant] = static_cast<uint8_t>(state_.coolantCelsius() + TemperatureOffset);
@@ -474,6 +494,8 @@ void ClusterCan::sendEngineTemperature() {
     for (uint8_t i = IndexFillerFirst; i < Length; ++i) {
         message[i] = frame::common::Filler;
     }
+    message[IndexInjectionLow] = lowByte16(injectionCounter_);
+    message[IndexInjectionHigh] = highByte16(injectionCounter_);
     message[IndexDistinctFiller] = DistinctFillerValue;
     bus_.send(message);
 }

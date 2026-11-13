@@ -28,10 +28,11 @@ SYNC1 = 0x55
 
 # rpm, speed, fuelDl, coolantC, outsideC, rangeKm,
 # flags, lights, turn, gearPos, gearNum, gearMode, dimmer, pedalPct,
-# flags2, hour, minute, second, day, month, year, warn, cruiseKmh
-_FMT = "<HHHhhHBBBBBBBBBBBBBBHBB"
+# flags2, hour, minute, second, day, month, year, warn, cruiseKmh,
+# consumptionPercent
+_FMT = "<HHHhhHBBBBBBBBBBBBBBHBBB"
 PAYLOAD_LEN = struct.calcsize(_FMT)
-assert PAYLOAD_LEN == 30, PAYLOAD_LEN
+assert PAYLOAD_LEN == 31, PAYLOAD_LEN
 
 # HostFlag in include/HostProtocol.h
 HF_KL15 = 0x01
@@ -109,6 +110,13 @@ class Setpoints:
     # successive 100 ms slots, so setting several at once is free here.
     warn: int = 0
 
+    # ---- consumption gauge --------------------------------------------------
+    # Instantaneous fuel demand, 0..100. The firmware turns this into the
+    # cumulative injected-fuel count on 0x1D0, which the cluster
+    # differentiates into its instant consumption reading. On higher trim
+    # clusters that is a separate needle; on others it appears on the display.
+    consumption_pct: int = 0
+
     # ---- fuel gauge behaviour ----------------------------------------------
     # False makes the gauge behave like a tank, which is correct for a
     # vehicle. True makes it follow the setpoint immediately, for a host that
@@ -175,6 +183,7 @@ class Setpoints:
             _clamp(year, 2000, 2200),
             self.warn & 0xFF,
             _clamp(self.cruise_kmh, 0, 250),
+            _clamp(self.consumption_pct, 0, 100),
         )
         checksum = PAYLOAD_LEN
         for b in payload:

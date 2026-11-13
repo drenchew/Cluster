@@ -8,19 +8,25 @@
 
 The dials read:
 
-    speedometer     network download rate   (full scale --max-mbit)
-    tachometer      memory in use           (full scale 5500 rpm)
-    fuel gauge      processor load          (full scale is a full tank)
-    coolant gauge   processor temperature   (degrees Celsius, unchanged)
-    on-board clock  this machine's clock
+    speedometer        network download rate  (full scale --max-mbit)
+    tachometer         memory in use          (full scale 5500 rpm)
+    consumption gauge  processor load         (0 to 100 percent demand)
+    fuel gauge         free filesystem space  (a full tank is an empty disk)
+    coolant gauge      processor temperature  (degrees Celsius, unchanged)
+    on-board clock     this machine's clock
 
 Telltales light for sustained processor load, memory nearly exhausted and a
 hot processor.
 
-Processor load is mapped onto the upper part of the fuel gauge, not the whole
-of it. The cluster raises its own low fuel warning from the level it is sent,
-so a needle taken down to empty at idle would light the reserve telltale and
-sound the chime. See --fuel-floor-l.
+Processor load is on the consumption gauge rather than the fuel gauge: the
+cluster raises its own low fuel warning from the level it is sent, so an idle
+machine on the fuel gauge would light the reserve telltale and sound the
+chime, and a warning the cluster raised itself cannot be cleared from here.
+The consumption gauge has no warning at either end.
+
+Free filesystem space takes the fuel gauge instead, which is the one quantity
+where that warning is useful: a tank approaching empty then means a disk
+approaching full. Raise --fuel-floor-l to suppress it.
 
 The fuel gauge damping is switched off per frame, because the gauge is showing
 a live measurement rather than the level in a tank. The firmware obeys that
@@ -68,10 +74,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="tachometer full scale (default 5500)")
     parser.add_argument("--tank-l", type=float, default=60.0,
                         help="fuel gauge full scale in litres (default 60)")
-    parser.add_argument("--fuel-floor-l", type=float, default=15.0,
-                        help="litres the fuel gauge reads at zero load. Keeps "
-                             "the needle clear of the cluster's own reserve "
-                             "warning, which appears near 8 l (default 15)")
+    parser.add_argument("--fuel-floor-l", type=float, default=0.0,
+                        help="litres the fuel gauge reads with the disk full. "
+                             "Raise it to keep clear of the cluster's own "
+                             "reserve warning near 8 l (default 0, which lets "
+                             "that warning act as a low disk alarm)")
+    parser.add_argument("--disk", default="/",
+                        help="filesystem shown on the fuel gauge (default /)")
     parser.add_argument("--smoothing", type=float, default=0.45,
                         help="needle smoothing half-life in seconds (default 0.45)")
     parser.add_argument("--no-clock", action="store_true",
@@ -104,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         sysmon.selftest()
         return 0
 
-    metrics = sysmon.SystemMetrics(interfaces=args.iface)
+    metrics = sysmon.SystemMetrics(interfaces=args.iface, disk_path=args.disk)
     mapper = sysmon.Mapper(sysmon.MapOptions(
         max_download_mbit=args.max_mbit,
         max_speed_kmh=args.max_speed,
@@ -122,8 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"interfaces : {', '.join(metrics.interfaces) or 'none found'}")
     print(f"temperature: {metrics.temperature_path or 'no sensor found'}")
     print(f"full scale : {args.max_mbit:.0f} Mbit/s -> {args.max_speed} km/h, "
-          f"memory -> {args.max_rpm} rpm, "
-          f"load -> {args.fuel_floor_l:.0f}..{args.tank_l:.0f} l")
+          f"memory -> {args.max_rpm} rpm, load -> consumption gauge, "
+          f"{args.disk} free -> {args.fuel_floor_l:.0f}..{args.tank_l:.0f} l")
     print(f"serial     : {port_text}")
     print()
     if not metrics.interfaces:

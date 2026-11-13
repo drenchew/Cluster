@@ -167,6 +167,10 @@ constexpr uint8_t IndexCoolant = 0;
 constexpr uint8_t IndexOil = 1;
 constexpr uint8_t IndexCounterAndState = 2;
 constexpr uint8_t IndexFillerFirst = 3;
+/// Cumulative injected fuel, little endian, differentiated by the cluster
+/// into its instant consumption reading.
+constexpr uint8_t IndexInjectionLow = 4;
+constexpr uint8_t IndexInjectionHigh = 5;
 constexpr uint8_t IndexDistinctFiller = 6;
 constexpr uint8_t IndexFillerLast = 7;
 constexpr int16_t TemperatureOffset = 48;

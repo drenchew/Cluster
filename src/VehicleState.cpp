@@ -105,6 +105,10 @@ void VehicleState::setCruiseKmh(uint8_t kmh) {
     cruiseKmh_ = kmh;
 }
 
+void VehicleState::setConsumptionPercent(uint8_t percent) {
+    consumptionPercent_ = clampTo<uint8_t>(percent, 0, cfg::consumption::MaxPercent);
+}
+
 void VehicleState::setWarningMask(uint8_t mask) {
     warningMask_ = mask;
 }
@@ -196,6 +200,10 @@ GearMode VehicleState::gearMode() const {
 
 uint8_t VehicleState::cruiseKmh() const {
     return cruiseKmh_;
+}
+
+uint8_t VehicleState::consumptionPercent() const {
+    return consumptionPercent_;
 }
 
 uint8_t VehicleState::warningMask() const {

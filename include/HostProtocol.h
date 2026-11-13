@@ -41,6 +41,7 @@ struct __attribute__((packed)) HostState {
     uint16_t year;
     uint8_t warningMask;    ///< see cfg::warn
     uint8_t cruiseKmh;      ///< zero switches cruise control off
+    uint8_t consumptionPercent;  ///< instantaneous fuel demand, 0 to 100
 };
 
 static_assert(sizeof(HostState) == cfg::host::PayloadBytes,
