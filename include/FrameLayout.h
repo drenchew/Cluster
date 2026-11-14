@@ -211,6 +211,11 @@ constexpr uint8_t RotatingLowNibble = 0x03;
 constexpr uint8_t RotatingModulus = 3;
 constexpr uint8_t Payload3 = 0xFC;
 constexpr uint8_t Payload4 = 0xCC;
+constexpr uint8_t IndexBrakeStatus = 5;
+/// Byte 5 carries brake system status. A capture of a healthy vehicle holds
+/// 0x00, 0x40, 0x41 or 0x61 here; which bits mean what is not established, so
+/// the value is adjustable at run time for bring-up.
+constexpr uint8_t BrakeStatusDefault = 0x00;
 }  // namespace stability
 
 /// 0x34F park brake status, two bytes. Event driven with a periodic repeat.

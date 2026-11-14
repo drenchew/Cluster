@@ -31,6 +31,7 @@ constexpr char CmdSymbol = 'y';
 constexpr char CmdDemo = 'd';
 constexpr char CmdConsumption = 'i';
 constexpr char CmdInjectionRate = 'j';
+constexpr char CmdBrakeStatus = 'z';
 constexpr char CmdFuelDamping = 'a';
 constexpr char CmdStatus = '?';
 
@@ -323,6 +324,12 @@ void SerialConsole::execute(char command, const char *argument) {
             } else {
                 Serial.println(F("injection rate back to the demand percentage"));
             }
+            break;
+
+        case CmdBrakeStatus:
+            cluster_.setBrakeStatus(static_cast<uint8_t>(value));
+            diag::printf("0x19E brake status byte = 0x%02X\n",
+                         static_cast<unsigned>(cluster_.brakeStatus()));
             break;
 
         case CmdFuelDamping:

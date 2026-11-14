@@ -85,6 +85,14 @@ public:
 
     float injectionRateOverride() const;
 
+    /// Sets byte 5 of the stability status frame, which carries brake system
+    /// status. Provided for bring-up: the meaning of its bits is not
+    /// established, and the cluster raises its red brake warning when it is
+    /// not satisfied with what this frame reports.
+    void setBrakeStatus(uint8_t value);
+
+    uint8_t brakeStatus() const;
+
     /// Selects how the distance accumulator advances and restarts it.
     void setOdometerMode(OdometerMode mode);
 
@@ -162,6 +170,7 @@ private:
     uint8_t brakeCounter_ = 0;
     uint8_t gearCounter_ = 0;
     uint8_t stabilityCounter_ = 0;
+    uint8_t stabilityBrakeStatus_ = frame::stability::BrakeStatusDefault;
     uint8_t cruiseTimer_ = 0;
     uint8_t lastCruiseSpeed_ = frame::cruise::SpeedWhenOff;
 

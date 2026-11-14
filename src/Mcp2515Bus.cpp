@@ -67,6 +67,16 @@ bool Mcp2515Bus::begin() {
     return ready;
 }
 
+void Mcp2515Bus::recover() {
+    // A controller in bus-off has switched its transmitter off and will not
+    // return by itself. Reinitialising restores it once the bus is healthy
+    // again, which is what happens when the cluster is powered back up.
+    consecutiveFailures_ = 0;
+    if (configure()) {
+        Serial.println(F("CAN recovered after a run of failures (bus-off?)"));
+    }
+}
+
 bool Mcp2515Bus::send(const CanMessage &message) {
     can_frame frame;
     memset(&frame, 0, sizeof(frame));
@@ -77,8 +87,13 @@ bool Mcp2515Bus::send(const CanMessage &message) {
     const bool sent = (controller_.sendMessage(&frame) == MCP2515::ERROR_OK);
     if (sent) {
         ++statistics_.transmitted;
+        consecutiveFailures_ = 0;
     } else {
         ++statistics_.failed;
+        ++consecutiveFailures_;
+        if (consecutiveFailures_ >= cfg::spi::FailuresBeforeReset) {
+            recover();
+        }
     }
     return sent;
 }

@@ -96,6 +96,14 @@ float ClusterCan::injectionRateOverride() const {
     return injectionRateOverride_;
 }
 
+void ClusterCan::setBrakeStatus(uint8_t value) {
+    stabilityBrakeStatus_ = value;
+}
+
+uint8_t ClusterCan::brakeStatus() const {
+    return stabilityBrakeStatus_;
+}
+
 void ClusterCan::setOdometerMode(OdometerMode mode) {
     state_.setOdometerMode(mode);
     distanceRemainder_ = 0.0f;
@@ -534,6 +542,7 @@ void ClusterCan::sendStabilityStatus() {
         RotatingLowNibble);
     message[3] = Payload3;
     message[4] = Payload4;
+    message[IndexBrakeStatus] = stabilityBrakeStatus_;
     message[IndexCounter] = stabilityCounter_;
 
     ++stabilityCounter_;

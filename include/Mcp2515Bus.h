@@ -48,6 +48,11 @@ private:
     /// Prints the wiring fault implied by a raw status register value.
     static void reportFault(uint8_t statusRegister);
 
+    /// Reinitialises the controller after a run of failed transmissions.
+    void recover();
+
     MCP2515 controller_;
     Statistics statistics_;
+    /// Failures since the last success, for bus-off detection.
+    uint32_t consecutiveFailures_ = 0;
 };

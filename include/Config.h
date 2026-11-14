@@ -35,6 +35,12 @@ namespace spi {
 /// tolerates 10 MHz on a printed circuit board.
 constexpr uint32_t ClockHz = 1000000UL;
 constexpr uint8_t ReadInstruction = 0x03;   ///< MCP2515 READ opcode
+/// Consecutive transmission failures after which the controller is
+/// reinitialised. A controller that has entered bus-off stays mute until it
+/// is reset, which otherwise means the link never returns after the cluster
+/// is powered down and back up. Set high enough that losing arbitration
+/// repeatedly on a busy bus cannot trigger it.
+constexpr uint32_t FailuresBeforeReset = 64;
 constexpr uint8_t StatusRegister = 0x0E;    ///< CANSTAT
 /// Values returned by a status read that indicate a specific wiring fault.
 constexpr uint8_t NoReply = 0x00;
@@ -79,12 +85,13 @@ constexpr uint16_t ClusterClock = 0x2F8;
 /// Enables for each group of transmitted frames.
 namespace send {
 constexpr bool WarningSuppression = true;  ///< [verified] 0x19E, 0x0C0, 0x0D7
-/// 0x12F engine controller status. Required only by the instant consumption
-/// reading, which is not driven: that gauge divides by road speed and so
-/// cannot show an independent quantity. Disabled because transmitting it
-/// coincided with the first transmission failures this jig has recorded,
-/// suggesting another node already owns the identifier.
-constexpr bool DmeStatus = false;
+/// 0x12F engine controller status, every 100 ms. Kept enabled even though the
+/// consumption reading it was added for is not driven: the cluster expects
+/// the engine controller to be reporting, and disabling this frame coincided
+/// with a warning appearing on the dial. It is not responsible for the
+/// transmission failures this jig records, which measure the same with it on
+/// and off.
+constexpr bool DmeStatus = true;
 constexpr bool Fuel = true;                ///< [verified] 0x349
 constexpr bool Coolant = true;             ///< [verified] 0x1D0
 constexpr bool Lights = true;              ///< [verified] 0x21A
@@ -366,7 +373,11 @@ constexpr uint16_t MaxSpeedKmh = 120;
 constexpr uint16_t RpmPerSecond = 1200;
 constexpr uint32_t StartDelayMs = 4000;   ///< cluster power-on needle sweep
 constexpr uint32_t IdleDwellMs = 2000;
-constexpr bool SweepSpeed = true;
+/// Left off here. A lit brake telltale combined with any road speed makes
+/// the cluster sound its warning continuously, and the sweep would raise the
+/// speed every time the host disconnects. The tachometer alone is enough to
+/// show that the board is alive.
+constexpr bool SweepSpeed = false;
 }  // namespace demo
 
 /// Text console shared with the binary host link.
