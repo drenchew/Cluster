@@ -59,6 +59,17 @@ constexpr uint8_t Length = 8;
 constexpr uint8_t Payload[Length] = {0x40, 0x40, 0x7F, 0x50, 0xFF, 0xFF, 0xFF, 0xFF};
 }  // namespace ignition
 
+/// 0x12F engine controller status, eight bytes, 100 ms. Static payload.
+///
+/// Transmitted because the instant consumption reading is a function of the
+/// engine controller, and the cluster does not display engine derived values
+/// unless that controller is reporting. Taken from the reference driver for
+/// this cluster, which drives its consumption gauge successfully.
+namespace dmeStatus {
+constexpr uint8_t Length = 8;
+constexpr uint8_t Payload[Length] = {0x3F, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00};
+}  // namespace dmeStatus
+
 /// 0x0AA engine speed and accelerator position, eight bytes, 20 ms.
 /// Drives the tachometer needle.
 namespace engineSpeed {
@@ -171,14 +182,21 @@ constexpr uint8_t IndexFillerFirst = 3;
 /// into its instant consumption reading.
 constexpr uint8_t IndexInjectionLow = 4;
 constexpr uint8_t IndexInjectionHigh = 5;
+constexpr uint8_t IndexFillerAfterState = 3;
 constexpr uint8_t IndexDistinctFiller = 6;
 constexpr uint8_t IndexFillerLast = 7;
+/// Fixed values taken from the reference driver. An earlier capture read
+/// 0xFF, 0xCC and 0xFF in these positions and the temperatures worked, but
+/// the consumption reading did not; these are the values the working driver
+/// sends.
+constexpr uint8_t FillerAfterStateValue = 0xCD;
+constexpr uint8_t FillerLastValue = 0xA8;
 constexpr int16_t TemperatureOffset = 48;
 /// Observed oil temperature runs below coolant by roughly this margin.
 constexpr int16_t OilBelowCoolant = 20;
 constexpr uint8_t StateRunning = 0x20;
 constexpr uint8_t StateStopped = 0x00;
-constexpr uint8_t DistinctFillerValue = 0xCC;
+constexpr uint8_t DistinctFillerValue = 0xCD;
 }  // namespace engineTemperature
 
 /// 0x19E stability control status, eight bytes, 200 ms.

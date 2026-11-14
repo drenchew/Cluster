@@ -76,6 +76,15 @@ public:
 
     bool fuelDamping() const;
 
+    /// Overrides the injected fuel rate with a literal count per 100 ms,
+    /// bypassing the demand percentage and its calibration constant. A
+    /// negative value restores normal operation. Provided for bring-up: the
+    /// cluster differentiates this counter, so finding the rate its gauge
+    /// expects is a matter of sweeping the rate and watching the needle.
+    void setInjectionRateOverride(float countsPer100Ms);
+
+    float injectionRateOverride() const;
+
     /// Selects how the distance accumulator advances and restarts it.
     void setOdometerMode(OdometerMode mode);
 
@@ -106,6 +115,7 @@ private:
 
     void sendTerminalStatus();
     void sendIgnitionStatus();
+    void sendDmeStatus();
     void sendEngineSpeed();
     void sendDistance();
     void sendDynamicsSpeed();
@@ -159,6 +169,8 @@ private:
     uint16_t injectionCounter_ = 0;
     float injectionRemainder_ = 0.0f;
     uint32_t lastInjectionMs_ = 0;
+    /// Negative means the demand percentage drives the rate instead.
+    float injectionRateOverride_ = -1.0f;
 
     // 0x1A6 accumulator state.
     uint16_t distanceCounter_ = 0;

@@ -29,6 +29,8 @@ constexpr char CmdWarnings = 'm';
 constexpr char CmdCruise = 'v';
 constexpr char CmdSymbol = 'y';
 constexpr char CmdDemo = 'd';
+constexpr char CmdConsumption = 'i';
+constexpr char CmdInjectionRate = 'j';
 constexpr char CmdFuelDamping = 'a';
 constexpr char CmdStatus = '?';
 
@@ -305,6 +307,22 @@ void SerialConsole::execute(char command, const char *argument) {
         case CmdDemo:
             demo_.resume();
             Serial.println(F("demo sweep resumed"));
+            break;
+
+        case CmdConsumption:
+            cluster_.state().setConsumptionPercent(static_cast<uint8_t>(value));
+            diag::printf("consumption demand %u%%\n",
+                         static_cast<unsigned>(state.consumptionPercent()));
+            break;
+
+        case CmdInjectionRate:
+            cluster_.setInjectionRateOverride(value);
+            if (value >= 0.0f) {
+                diag::printf("injection rate forced to %ld counts/100ms\n",
+                             static_cast<long>(value));
+            } else {
+                Serial.println(F("injection rate back to the demand percentage"));
+            }
             break;
 
         case CmdFuelDamping:

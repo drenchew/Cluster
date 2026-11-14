@@ -5,7 +5,7 @@ The cluster becomes a system monitor:
     speedometer        network download rate
     tachometer         memory in use
     consumption gauge  processor load
-    fuel gauge         free space on the filesystem
+    fuel gauge         battery charge
 
 This cluster carries four needles: road speed, engine speed, fuel level and
 instant consumption. There is no coolant temperature needle on this variant;
@@ -45,6 +45,7 @@ PROC_STAT = "/proc/stat"
 PROC_NET_DEV = "/proc/net/dev"
 SYS_NET = "/sys/class/net"
 SYS_HWMON = "/sys/class/hwmon"
+SYS_POWER = "/sys/class/power_supply"
 SYS_THERMAL = "/sys/class/thermal"
 
 LOOPBACK = "lo"
@@ -84,6 +85,20 @@ def default_interfaces() -> list[str]:
         state = _read_text(os.path.join(path, "operstate"))
         if state is None or state.strip() == "up":
             found.append(name)
+    return found
+
+
+def find_battery_path() -> str | None:
+    """Directory of the first battery the kernel reports, or None.
+
+    A desktop exposes only mains supplies, so the absence of a battery is a
+    normal condition rather than an error.
+    """
+    found = None
+    for path in sorted(glob.glob(os.path.join(SYS_POWER, "*"))):
+        kind = (_read_text(os.path.join(path, "type")) or "").strip()
+        if kind == "Battery" and found is None:
+            found = path
     return found
 
 
@@ -136,6 +151,9 @@ class Reading:
     memory_total_bytes: int = 0
     disk_free: float = 0.0          # 0..1 of the filesystem
     disk_total_bytes: int = 0
+    battery_present: bool = False
+    battery_charge: float = 0.0     # 0..1 of full charge
+    battery_charging: bool = False
 
 
 @dataclass
@@ -154,8 +172,11 @@ class SystemMetrics:
 
     def __init__(self, interfaces: list[str] | None = None,
                  temperature_path: str | None = None,
-                 disk_path: str = "/"):
+                 disk_path: str = "/",
+                 battery_path: str | None = None):
         self._disk_path = disk_path
+        self._battery_path = (battery_path if battery_path is not None
+                              else find_battery_path())
         self._interfaces = interfaces if interfaces else default_interfaces()
         self._temperature_path = (
             temperature_path if temperature_path is not None else find_cpu_temperature_path())
@@ -170,6 +191,10 @@ class SystemMetrics:
     @property
     def temperature_path(self) -> str | None:
         return self._temperature_path
+
+    @property
+    def battery_path(self) -> str | None:
+        return self._battery_path
 
     # -- individual sources ----------------------------------------------
     def _memory(self) -> tuple[float, int]:
@@ -252,6 +277,43 @@ class SystemMetrics:
             pass
         return free, total
 
+    def _battery(self) -> tuple[bool, float, bool]:
+        """(present, charge fraction, charging).
+
+        The driver reports a ready made percentage, which is preferred because
+        it already accounts for whichever of the charge or energy counters the
+        hardware provides. The counters are read only as a fallback.
+        """
+        present = False
+        charge = 0.0
+        charging = False
+
+        if self._battery_path is not None:
+            percent = _read_text(os.path.join(self._battery_path, "capacity"))
+            if percent is not None and percent.strip():
+                try:
+                    charge = max(0.0, min(1.0, int(percent.strip()) / 100.0))
+                    present = True
+                except ValueError:
+                    present = False
+            if not present:
+                for now_name, full_name in (("charge_now", "charge_full"),
+                                            ("energy_now", "energy_full")):
+                    now = _read_text(os.path.join(self._battery_path, now_name))
+                    full = _read_text(os.path.join(self._battery_path, full_name))
+                    if now and full and not present:
+                        try:
+                            total = int(full.strip())
+                            if total > 0:
+                                charge = max(0.0, min(1.0, int(now.strip()) / total))
+                                present = True
+                        except ValueError:
+                            pass
+            status = (_read_text(os.path.join(self._battery_path, "status")) or "").strip()
+            charging = status in ("Charging", "Full")
+
+        return present, charge, charging
+
     def _temperature(self) -> float | None:
         value = None
         if self._temperature_path is not None:
@@ -285,6 +347,7 @@ class SystemMetrics:
                 down = max(0, received - self._last_net[0]) / elapsed
                 up = max(0, transmitted - self._last_net[1]) / elapsed
                 disk_free, disk_total = self._disk()
+                battery_present, battery_charge, battery_charging = self._battery()
                 reading = Reading(download_bytes_per_s=down,
                                   upload_bytes_per_s=up,
                                   memory_used=used,
@@ -292,7 +355,10 @@ class SystemMetrics:
                                   cpu_celsius=self._temperature(),
                                   memory_total_bytes=total,
                                   disk_free=disk_free,
-                                  disk_total_bytes=disk_total)
+                                  disk_total_bytes=disk_total,
+                                  battery_present=battery_present,
+                                  battery_charge=battery_charge,
+                                  battery_charging=battery_charging)
 
         self._last_net = (received, transmitted)
         self._last_time = now
@@ -321,16 +387,25 @@ class MapOptions:
     # the cumulative injected-fuel count the cluster differentiates.
     max_consumption_percent: int = 100
 
-    # The fuel gauge shows free space on the filesystem, which is the one
-    # quantity where the cluster's own low level warning is useful rather than
-    # a nuisance: a tank approaching empty then means a disk approaching full.
-    # The reserve warning appears near 8 litres of 60, so it fires at roughly
-    # 13 percent free.
+    # The fuel gauge shows the battery charge, which is the natural fit: both
+    # are a reserve being consumed, and the cluster's own low fuel warning
+    # then means a low battery, which is worth having rather than a nuisance.
+    # That warning appears near 8 litres of 60, so it fires at roughly
+    # 13 percent charge.
+    #
+    # A machine with no battery falls back to free filesystem space, so the
+    # needle still shows a reserve rather than sitting at empty.
     tank_litres: float = 60.0
 
     # Raise this to keep the needle clear of that warning, at the cost of the
-    # bottom of the dial. Zero allows the warning to act as a low disk alarm.
+    # bottom of the dial. Zero allows it to act as a low battery alarm.
     fuel_floor_litres: float = 0.0
+
+    # Charge below this lights the charging fault telltale, which is the
+    # cluster's own symbol for a battery that is not keeping up. Suppressed
+    # while the machine is on mains, since a low battery that is charging is
+    # not a fault.
+    warn_battery_charge: float = 0.15
 
     # Processor temperature is reported as the coolant temperature unchanged,
     # since both are temperatures in degrees Celsius. This variant of the
@@ -425,10 +500,12 @@ class Mapper:
         # Processor load drives the consumption gauge.
         sp.consumption_pct = int(round(cpu * opt.max_consumption_percent))
 
-        # Free filesystem space drives the fuel gauge: a full tank means an
-        # empty disk.
+        # Battery charge drives the fuel gauge, falling back to free
+        # filesystem space on a machine that has no battery.
+        reserve = (reading.battery_charge if reading.battery_present
+                   else reading.disk_free)
         usable = max(0.0, opt.tank_litres - opt.fuel_floor_litres)
-        sp.fuel_l = opt.fuel_floor_litres + _clamp_unit(reading.disk_free) * usable
+        sp.fuel_l = opt.fuel_floor_litres + _clamp_unit(reserve) * usable
         sp.coolant_c = int(round(celsius))
 
         # The gauge must not be damped here. The firmware models a real tank
@@ -459,6 +536,9 @@ class Mapper:
             warn |= lk.WARN_TYRE
         if celsius >= opt.warn_cpu_celsius:
             warn |= lk.WARN_COOLANT
+        if (reading.battery_present and not reading.battery_charging
+                and reading.battery_charge <= opt.warn_battery_charge):
+            warn |= lk.WARN_BATTERY
         sp.warn = warn
 
         if opt.show_clock:
@@ -475,10 +555,15 @@ def describe(reading: Reading, sp: lk.Setpoints, opt: MapOptions) -> str:
     down_mbit = reading.download_bytes_per_s * BITS_PER_BYTE / BITS_PER_MEGABIT
     up_mbit = reading.upload_bytes_per_s * BITS_PER_BYTE / BITS_PER_MEGABIT
     temperature = ("%.0fC" % reading.cpu_celsius) if reading.cpu_celsius is not None else "--"
+    if reading.battery_present:
+        reserve = (f"batt {reading.battery_charge * 100:3.0f}%"
+                   f"{'+' if reading.battery_charging else '-'}")
+    else:
+        reserve = f"disk {reading.disk_free * 100:3.0f}%"
     return (f"down {down_mbit:7.2f} Mbit/s -> {sp.speed_kmh:3d} km/h   "
             f"ram {reading.memory_used * 100:5.1f}% -> {sp.rpm:4d} rpm   "
             f"cpu {reading.cpu_load * 100:5.1f}% -> {sp.consumption_pct:3d}%   "
-            f"disk {reading.disk_free * 100:4.1f}% free -> {sp.fuel_l:4.1f} l   "
+            f"{reserve} -> {sp.fuel_l:4.1f} l   "
             f"temp {temperature} -> {sp.coolant_c:3d}C   "
             f"up {up_mbit:5.2f} Mbit/s   warn 0x{sp.warn:02X}")
 
@@ -504,12 +589,15 @@ def selftest() -> None:
     # three quarters of the filesystem free.
     half = Reading(download_bytes_per_s=full_scale / 2,
                    memory_used=0.5, cpu_load=0.25, cpu_celsius=55.0,
-                   disk_free=0.75)
+                   disk_free=0.75, battery_present=True, battery_charge=0.5,
+                   battery_charging=True)
     sp = mapper.to_setpoints(half, now=0.0)
     assert sp.speed_kmh == 130, sp.speed_kmh
     assert sp.rpm == 2750, sp.rpm
     assert sp.consumption_pct == 25, sp.consumption_pct
-    assert abs(sp.fuel_l - 45.0) < 0.01, sp.fuel_l
+    # Battery takes the fuel gauge, so half a charge is half a tank. The
+    # filesystem figure is deliberately different, to catch a mix-up.
+    assert abs(sp.fuel_l - 30.0) < 0.01, sp.fuel_l
     assert sp.coolant_c == 55, sp.coolant_c
     assert sp.warn == 0, hex(sp.warn)
     assert sp.fuel_direct, "the gauge shows a measurement, not a tank level"
@@ -520,7 +608,8 @@ def selftest() -> None:
     mapper = Mapper(opt)
     loaded = Reading(download_bytes_per_s=full_scale * 4,
                      memory_used=1.0, cpu_load=1.0, cpu_celsius=95.0,
-                     disk_free=1.0)
+                     disk_free=1.0, battery_present=True, battery_charge=1.0,
+                     battery_charging=True)
     sp = mapper.to_setpoints(loaded, now=0.0)
     assert sp.speed_kmh == opt.max_speed_kmh, sp.speed_kmh
     assert sp.rpm == opt.max_rpm, sp.rpm
@@ -534,7 +623,7 @@ def selftest() -> None:
 
     # An idle machine sits at the bottom of the needles it drives.
     mapper = Mapper(opt)
-    idle = Reading(cpu_celsius=40.0, disk_free=0.5)
+    idle = Reading(cpu_celsius=40.0, battery_present=True, battery_charge=0.5)
     sp = mapper.to_setpoints(idle, now=0.0)
     assert sp.speed_kmh == 0 and sp.rpm == 0, (sp.speed_kmh, sp.rpm)
     assert sp.consumption_pct == 0, sp.consumption_pct
@@ -545,17 +634,40 @@ def selftest() -> None:
     # way to clear a warning the cluster raised itself.
     for percent in range(0, 101):
         level = mapper.to_setpoints(
-            Reading(cpu_load=percent / 100.0, disk_free=0.5, cpu_celsius=40.0),
-            now=0.0).fuel_l
+            Reading(cpu_load=percent / 100.0, battery_present=True,
+                    battery_charge=0.5, cpu_celsius=40.0), now=0.0).fuel_l
         assert abs(level - 30.0) < 0.01, (percent, level)
 
-    # The fuel gauge follows the filesystem, and a nearly full disk is allowed
-    # to reach the reserve warning, where it means something.
+    # The fuel gauge follows the battery, and a nearly flat one is allowed to
+    # reach the reserve warning, where it means something.
     mapper = Mapper(opt)
-    roomy = mapper.to_setpoints(Reading(disk_free=0.9, cpu_celsius=40.0), now=0.0)
-    cramped = mapper.to_setpoints(Reading(disk_free=0.05, cpu_celsius=40.0), now=0.0)
-    assert roomy.fuel_l > RESERVE_WARNING_LITRES, roomy.fuel_l
-    assert cramped.fuel_l < RESERVE_WARNING_LITRES, cramped.fuel_l
+    charged = mapper.to_setpoints(
+        Reading(battery_present=True, battery_charge=0.9, cpu_celsius=40.0), now=0.0)
+    flat = mapper.to_setpoints(
+        Reading(battery_present=True, battery_charge=0.05, cpu_celsius=40.0), now=0.0)
+    assert charged.fuel_l > RESERVE_WARNING_LITRES, charged.fuel_l
+    assert flat.fuel_l < RESERVE_WARNING_LITRES, flat.fuel_l
+
+    # A flat battery on mains is charging, not failing, so the telltale stays
+    # out; the same charge on battery power lights it.
+    mapper = Mapper(opt)
+    on_mains = mapper.to_setpoints(
+        Reading(battery_present=True, battery_charge=0.05, battery_charging=True,
+                cpu_celsius=40.0), now=0.0)
+    assert not (on_mains.warn & lk.WARN_BATTERY), "charging is not a fault"
+    mapper = Mapper(opt)
+    on_battery = mapper.to_setpoints(
+        Reading(battery_present=True, battery_charge=0.05, battery_charging=False,
+                cpu_celsius=40.0), now=0.0)
+    assert on_battery.warn & lk.WARN_BATTERY, "a flat battery should warn"
+
+    # A machine with no battery falls back to the filesystem, so the needle
+    # still shows a reserve rather than reading empty.
+    mapper = Mapper(opt)
+    desktop = mapper.to_setpoints(
+        Reading(battery_present=False, disk_free=0.5, cpu_celsius=40.0), now=0.0)
+    assert abs(desktop.fuel_l - 30.0) < 0.01, desktop.fuel_l
+    assert not (desktop.warn & lk.WARN_BATTERY), "no battery is not a flat battery"
 
     # A machine with no temperature sensor must not read as frozen.
     mapper = Mapper(opt)
@@ -585,7 +697,7 @@ def selftest() -> None:
 
     assert "down" in describe(half, sp, opt)
     print("sysmon selftest OK  (mapping, full scale, idle, smoothing, "
-          "disk, missing sensors)")
+          "battery, fallback, missing sensors)")
 
 
 def main(argv: list[str] | None = None) -> int:

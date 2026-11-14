@@ -46,6 +46,7 @@ constexpr uint32_t RetryDelayMs = 1000;
 namespace canid {
 constexpr uint16_t AbsCounter = 0x0C0;
 constexpr uint16_t AirbagCounter = 0x0D7;
+constexpr uint16_t DmeStatus = 0x12F;
 constexpr uint16_t EngineSpeed = 0x0AA;
 constexpr uint16_t WheelSpeeds = 0x0CE;
 constexpr uint16_t TerminalStatus = 0x130;
@@ -78,6 +79,7 @@ constexpr uint16_t ClusterClock = 0x2F8;
 /// Enables for each group of transmitted frames.
 namespace send {
 constexpr bool WarningSuppression = true;  ///< [verified] 0x19E, 0x0C0, 0x0D7
+constexpr bool DmeStatus = true;           ///< [verified] 0x12F engine controller status
 constexpr bool Fuel = true;                ///< [verified] 0x349
 constexpr bool Coolant = true;             ///< [verified] 0x1D0
 constexpr bool Lights = true;              ///< [verified] 0x21A
@@ -114,15 +116,18 @@ constexpr uint8_t SlotLightsB = 12;
 constexpr uint8_t SlotIgnition = 3;
 constexpr uint8_t SlotBrakeA = 4;
 constexpr uint8_t SlotBrakeB = 14;
-constexpr uint8_t SlotCoolant = 5;
-constexpr uint8_t SlotAbsCounter = 6;
+constexpr uint8_t SlotCoolantA = 5;
+constexpr uint8_t SlotCoolantB = 15;
+/// The two small suppression counters share a slot; both are two byte frames.
+constexpr uint8_t SlotSuppressionCounters = 6;
+constexpr uint8_t SlotDmeStatusA = 2;
+constexpr uint8_t SlotDmeStatusB = 12;
 constexpr uint8_t SlotDistanceA = 7;
 constexpr uint8_t SlotDistanceB = 17;
 constexpr uint8_t SlotWheelSpeedA = 8;
 constexpr uint8_t SlotWheelSpeedB = 18;
 constexpr uint8_t SlotFuel = 9;
 constexpr uint8_t SlotTurnSignals = 13;
-constexpr uint8_t SlotAirbagCounter = 15;
 constexpr uint8_t SlotGear = 16;
 constexpr uint8_t SlotReverseAndLcd = 19;
 

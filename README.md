@@ -413,7 +413,7 @@ This cluster has four needles, and the mode drives all four:
 | speedometer | network download rate | `--max-mbit`, default 100 Mbit/s, maps to 260 km/h |
 | tachometer | memory in use | 5500 rpm, the diesel redline |
 | consumption | processor load | 0 to 100 percent demand |
-| fuel level | free filesystem space | a full tank is an empty disk |
+| fuel level | battery charge | a full tank is a full battery |
 
 The clock shows the host's time. Processor temperature is sent as the coolant
 temperature, but **this cluster variant has no coolant needle** — the
@@ -429,9 +429,10 @@ rather than consumption — the reference notes both variants exist — then
 twenty degrees.
 
 Telltales light on sustained load: check engine above 90 percent processor,
-tyre pressure above 90 percent memory, and the coolant warning above 85 °C.
-Memory uses the tyre pressure symbol rather than the fuel reserve one for the
-reason given below.
+tyre pressure above 90 percent memory, the coolant warning above 85 °C, and
+the charging fault below 15 percent battery while on battery power. Memory
+uses the tyre pressure symbol rather than the fuel reserve one for the reason
+given below.
 
 Every value comes from `/proc` and `/sys`, so the only dependency is the
 `pyserial` the rest of the host tooling already needs. Memory in use is
@@ -461,11 +462,13 @@ between frames, without which a demand of one percent would never move the
 counter at all. On higher trim clusters this is a separate needle; on others
 the same value appears on the multi function display.
 
-Free filesystem space takes the fuel gauge, which is the one quantity where
-the cluster's own warning is useful rather than a nuisance: a tank approaching
-empty then means a disk approaching full. `--fuel-floor-l` raises the bottom
-of the range to suppress it; the default of zero leaves it as a genuine low
-disk alarm.
+Battery charge takes the fuel gauge. Both are a reserve being consumed, so the
+cluster's own low fuel warning becomes a low battery warning, which is worth
+having rather than a nuisance — and the charging fault telltale lights below
+15 percent, suppressed while on mains, since a low battery that is charging is
+not a fault. A machine with no battery falls back to free filesystem space, so
+the needle still shows a reserve instead of reading empty. `--fuel-floor-l`
+raises the bottom of the range to suppress the warning.
 
 The fuel reserve symbol is not assigned to anything here, since it is the
 cluster's to raise. Memory pressure uses the tyre pressure symbol instead: it
@@ -476,6 +479,27 @@ Measured against the real driver: demand of 25, 50 and 100 percent produces
 150, 300 and 600 counts per second, exactly proportional; zero demand does not
 move the counter; one percent for twenty seconds accumulates 121 counts; and
 the counter keeps climbing after it wraps.
+
+Getting the gauge to respond on hardware needed two further things, both found
+by comparing against the reference driver rather than by reasoning:
+
+- **0x12F, the engine controller status frame**, every 100 ms with a fixed
+  payload. The consumption reading is an engine controller function, and the
+  cluster does not display it while that controller is silent.
+- **0x1D0 at 100 ms with the reference's filler bytes** — `0xCD` in bytes 3
+  and 6 and `0xA8` in byte 7, where an earlier capture had suggested `0xFF`,
+  `0xCC` and `0xFF`. The temperatures worked with the old values; the
+  consumption reading did not.
+
+One limitation is inherent to the gauge. It reads economy, distance divided by
+fuel, so it depends on road speed as well as the injection rate — and in this
+mode road speed is the download rate. The needle therefore shows a ratio of
+the two rather than processor load alone, and it reads at the top of its scale
+when nothing is downloading. Decoupling them is possible, because the
+speedometer is driven by 0x1A0 while consumption uses the separate 0x1A6
+distance accumulator, which can be advanced at a fixed synthetic rate; the
+cost is that the odometer then accrues mileage independently of the displayed
+speed.
 
 **Needles need smoothing, gauges need none.** A download rate measured over a
 tenth of a second varies far more than the quantity being displayed, so the

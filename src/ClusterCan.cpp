@@ -88,6 +88,14 @@ bool ClusterCan::fuelDamping() const {
     return fuel_.damping();
 }
 
+void ClusterCan::setInjectionRateOverride(float countsPer100Ms) {
+    injectionRateOverride_ = countsPer100Ms;
+}
+
+float ClusterCan::injectionRateOverride() const {
+    return injectionRateOverride_;
+}
+
 void ClusterCan::setOdometerMode(OdometerMode mode) {
     state_.setOdometerMode(mode);
     distanceRemainder_ = 0.0f;
@@ -148,6 +156,9 @@ void ClusterCan::serviceSlot(uint8_t slot) {
             if (cfg::send::Lights) {
                 sendLighting();
             }
+            if (cfg::send::DmeStatus) {
+                sendDmeStatus();
+            }
             break;
 
         case cfg::schedule::SlotBrakeA:
@@ -182,15 +193,17 @@ void ClusterCan::serviceSlot(uint8_t slot) {
             sendIgnitionStatus();
             break;
 
-        case cfg::schedule::SlotCoolant:
+        case cfg::schedule::SlotCoolantA:
+        case cfg::schedule::SlotCoolantB:
             if (cfg::send::Coolant) {
                 sendEngineTemperature();
             }
             break;
 
-        case cfg::schedule::SlotAbsCounter:
+        case cfg::schedule::SlotSuppressionCounters:
             if (cfg::send::WarningSuppression) {
                 sendAbsCounter();
+                sendAirbagCounter();
             }
             break;
 
@@ -203,12 +216,6 @@ void ClusterCan::serviceSlot(uint8_t slot) {
         case cfg::schedule::SlotTurnSignals:
             if (cfg::send::TurnSignals) {
                 sendTurnSignals();
-            }
-            break;
-
-        case cfg::schedule::SlotAirbagCounter:
-            if (cfg::send::WarningSuppression) {
-                sendAirbagCounter();
             }
             break;
 
@@ -306,6 +313,14 @@ void ClusterCan::sendIgnitionStatus() {
     CanMessage message(cfg::canid::IgnitionStatus, frame::ignition::Length);
     for (uint8_t i = 0; i < frame::ignition::Length; ++i) {
         message[i] = frame::ignition::Payload[i];
+    }
+    bus_.send(message);
+}
+
+void ClusterCan::sendDmeStatus() {
+    CanMessage message(cfg::canid::DmeStatus, frame::dmeStatus::Length);
+    for (uint8_t i = 0; i < frame::dmeStatus::Length; ++i) {
+        message[i] = frame::dmeStatus::Payload[i];
     }
     bus_.send(message);
 }
@@ -465,8 +480,12 @@ void ClusterCan::advanceInjection(uint32_t nowMs) {
 
     const float intervals = static_cast<float>(elapsedMs) /
                             static_cast<float>(cfg::consumption::ReferenceIntervalMs);
-    injectionRemainder_ += static_cast<float>(state_.consumptionPercent()) *
-                           cfg::consumption::CountsPerPercentPer100Ms * intervals;
+    const float ratePer100Ms =
+        (injectionRateOverride_ >= 0.0f)
+            ? injectionRateOverride_
+            : (static_cast<float>(state_.consumptionPercent()) *
+               cfg::consumption::CountsPerPercentPer100Ms);
+    injectionRemainder_ += ratePer100Ms * intervals;
     const uint16_t whole = static_cast<uint16_t>(injectionRemainder_);
     injectionRemainder_ -= static_cast<float>(whole);
     // Allowed to wrap, as the counter in a vehicle does.
@@ -491,12 +510,11 @@ void ClusterCan::sendEngineTemperature() {
     message[IndexOil] = static_cast<uint8_t>(oil + TemperatureOffset);
     message[IndexCounterAndState] =
         static_cast<uint8_t>(engineTemperatureCounter_ | runState);
-    for (uint8_t i = IndexFillerFirst; i < Length; ++i) {
-        message[i] = frame::common::Filler;
-    }
+    message[IndexFillerAfterState] = FillerAfterStateValue;
     message[IndexInjectionLow] = lowByte16(injectionCounter_);
     message[IndexInjectionHigh] = highByte16(injectionCounter_);
     message[IndexDistinctFiller] = DistinctFillerValue;
+    message[IndexFillerLast] = FillerLastValue;
     bus_.send(message);
 }
 

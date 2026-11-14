@@ -11,7 +11,7 @@ The dials read:
     speedometer        network download rate  (full scale --max-mbit)
     tachometer         memory in use          (full scale 5500 rpm)
     consumption gauge  processor load         (0 to 100 percent demand)
-    fuel gauge         free filesystem space  (a full tank is an empty disk)
+    fuel gauge         battery charge         (a full tank is a full battery)
     on-board clock     this machine's clock
 
 Those are the four needles this cluster has. Processor temperature is also
@@ -27,9 +27,11 @@ machine on the fuel gauge would light the reserve telltale and sound the
 chime, and a warning the cluster raised itself cannot be cleared from here.
 The consumption gauge has no warning at either end.
 
-Free filesystem space takes the fuel gauge instead, which is the one quantity
-where that warning is useful: a tank approaching empty then means a disk
-approaching full. Raise --fuel-floor-l to suppress it.
+Battery charge takes the fuel gauge, which is the natural fit: both are a
+reserve being consumed, and the cluster's own low fuel warning then means a
+low battery. A machine with no battery falls back to free filesystem space so
+the needle still shows a reserve. Raise --fuel-floor-l to suppress the
+warning.
 
 The fuel gauge damping is switched off per frame, because the gauge is showing
 a live measurement rather than the level in a tank. The firmware obeys that
@@ -78,10 +80,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tank-l", type=float, default=60.0,
                         help="fuel gauge full scale in litres (default 60)")
     parser.add_argument("--fuel-floor-l", type=float, default=0.0,
-                        help="litres the fuel gauge reads with the disk full. "
+                        help="litres the fuel gauge reads at zero charge. "
                              "Raise it to keep clear of the cluster's own "
                              "reserve warning near 8 l (default 0, which lets "
-                             "that warning act as a low disk alarm)")
+                             "that warning act as a low battery alarm)")
     parser.add_argument("--disk", default="/",
                         help="filesystem shown on the fuel gauge (default /)")
     parser.add_argument("--smoothing", type=float, default=0.45,
@@ -133,9 +135,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"interfaces : {', '.join(metrics.interfaces) or 'none found'}")
     print(f"temperature: {metrics.temperature_path or 'no sensor found'}")
+    print(f"battery    : {metrics.battery_path or 'none, using filesystem instead'}")
     print(f"full scale : {args.max_mbit:.0f} Mbit/s -> {args.max_speed} km/h, "
           f"memory -> {args.max_rpm} rpm, load -> consumption gauge, "
-          f"{args.disk} free -> {args.fuel_floor_l:.0f}..{args.tank_l:.0f} l")
+          f"charge -> {args.fuel_floor_l:.0f}..{args.tank_l:.0f} l")
     print(f"serial     : {port_text}")
     print()
     if not metrics.interfaces:
