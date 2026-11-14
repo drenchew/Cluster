@@ -32,6 +32,7 @@
  *   i 0..100 instant consumption demand, drives the mpg needle
  *   j <n>    force the injected-fuel rate to n counts per 100 ms,
  *            negative to return to the demand percentage
+ *   q <n>    clear every check-control symbol from 1 to n
  *   z <n>    0x19E byte 5, the brake system status byte
  *   a 0|1    fuel gauge damping: 1 behaves like a tank, 0 follows
  *            the setpoint at once for a live measurement

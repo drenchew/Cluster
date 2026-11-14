@@ -97,7 +97,15 @@ constexpr bool Coolant = true;             ///< [verified] 0x1D0
 constexpr bool Lights = true;              ///< [verified] 0x21A
 constexpr bool TurnSignals = true;         ///< [verified] 0x1F6
 constexpr bool Cruise = true;              ///< [verified] 0x193
-constexpr bool Brake = true;               ///< [verified] 0x1B4
+/// 0x1B4 must NOT be transmitted. A receive-identifier dump shows the cluster
+/// sending it about ten times a second, and the database names KOMBI as its
+/// sender: the cluster owns this frame, including the handbrake bits and the
+/// speed word in it. Transmitting it put two senders behind one identifier,
+/// which collide bit for bit and generate error frames, and left the cluster
+/// being contradicted about its own brake state. Speed reaches the needle
+/// through 0x1A0 and 0x0CE, and the handbrake through 0x34F, which the
+/// cluster does not transmit.
+constexpr bool Brake = false;              ///< 0x1B4
 constexpr bool ParkBrake = true;           ///< [verified] 0x34F
 constexpr bool Clock = true;               ///< [verified] 0x39E
 constexpr bool Symbols = true;             ///< [verified] 0x592
@@ -171,6 +179,14 @@ constexpr uint16_t MaxRangeKm = 2000;
 constexpr uint8_t MaxGearNumber = 8;
 constexpr uint8_t MaxCruiseKmh = 250;
 constexpr bool EngineRunningAtBoot = true;
+
+/// Engaging the handbrake above this speed is treated by the cluster as a
+/// brake event and latched: releasing it does not extinguish the warning,
+/// which stays lit until the cluster observes a clean release at standstill.
+/// Observed on an A2C53117692 at roughly 20 km/h.
+constexpr uint16_t HandbrakeLatchSpeedKmh = 20;
+/// Separation between the engage and release of the clearing pulse.
+constexpr uint32_t HandbrakeClearPulseMs = 250;
 }  // namespace limits
 
 /// Values the cluster is driven with before anything supplies setpoints.

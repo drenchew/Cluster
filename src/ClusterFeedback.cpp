@@ -11,8 +11,36 @@ constexpr uint8_t IndexSecond = 2;
 
 }  // namespace
 
+void ClusterFeedback::track(uint16_t identifier) {
+    bool found = false;
+    for (uint8_t i = 0; i < seenUsed_ && !found; ++i) {
+        if (seenId_[i] == identifier) {
+            ++seenCount_[i];
+            found = true;
+        }
+    }
+    if (!found && seenUsed_ < TrackedIdentifiers) {
+        seenId_[seenUsed_] = identifier;
+        seenCount_[seenUsed_] = 1;
+        ++seenUsed_;
+    }
+}
+
+uint8_t ClusterFeedback::distinctCount() const {
+    return seenUsed_;
+}
+
+uint16_t ClusterFeedback::identifierAt(uint8_t index) const {
+    return (index < seenUsed_) ? seenId_[index] : 0;
+}
+
+uint16_t ClusterFeedback::countAt(uint8_t index) const {
+    return (index < seenUsed_) ? seenCount_[index] : 0;
+}
+
 bool ClusterFeedback::consume(const CanMessage &message, uint32_t nowMs) {
     bool recognised = false;
+    track(message.identifier());
 
     if (message.identifier() == cfg::canid::ClusterTemperature &&
         message.length() >= TemperatureMinBytes) {

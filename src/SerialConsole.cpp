@@ -32,6 +32,7 @@ constexpr char CmdDemo = 'd';
 constexpr char CmdConsumption = 'i';
 constexpr char CmdInjectionRate = 'j';
 constexpr char CmdBrakeStatus = 'z';
+constexpr char CmdSymbolSweep = 'q';
 constexpr char CmdFuelDamping = 'a';
 constexpr char CmdStatus = '?';
 
@@ -91,6 +92,15 @@ void SerialConsole::printStatus() const {
                                            : "(never set - no 0x39E yet)");
     diag::printf("fuel gauge %s\n",
                  cluster_.fuelDamping() ? "damped (tank)" : "direct (live)");
+    const ClusterFeedback &rx = cluster_.feedback();
+    if (rx.distinctCount() != 0) {
+        Serial.print(F("from cluster:"));
+        for (uint8_t i = 0; i < rx.distinctCount(); ++i) {
+            diag::printf(" %03X x%u", static_cast<unsigned>(rx.identifierAt(i)),
+                         static_cast<unsigned>(rx.countAt(i)));
+        }
+        Serial.println();
+    }
     diag::printf("tx %lu fail %lu rx %lu | host %s frames %lu err %lu\n",
                 static_cast<unsigned long>(stats.transmitted),
                 static_cast<unsigned long>(stats.failed),
@@ -330,6 +340,12 @@ void SerialConsole::execute(char command, const char *argument) {
             cluster_.setBrakeStatus(static_cast<uint8_t>(value));
             diag::printf("0x19E brake status byte = 0x%02X\n",
                          static_cast<unsigned>(cluster_.brakeStatus()));
+            break;
+
+        case CmdSymbolSweep:
+            cluster_.startSymbolSweep(static_cast<uint16_t>(value));
+            diag::printf("clearing every symbol from 1 to %u\n",
+                         static_cast<unsigned>(value));
             break;
 
         case CmdFuelDamping:

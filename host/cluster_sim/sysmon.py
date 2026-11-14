@@ -526,6 +526,12 @@ class Mapper:
         # little over 800 rpm.
         sp.kl15 = True
         sp.engine = True
+
+        # Never engaged. The cluster latches its brake warning if the
+        # handbrake is applied above about 20 km/h and will not extinguish it
+        # until it sees a clean release at standstill, and road speed here is
+        # the download rate, which goes well past that. There is also nothing
+        # on a system monitor that a handbrake would mean.
         sp.handbrake = False
         sp.gear_pos = lk.GEAR_D
         sp.gear_num = 0
@@ -606,6 +612,7 @@ def selftest() -> None:
     assert sp.coolant_c == 55, sp.coolant_c
     assert sp.warn == 0, hex(sp.warn)
     assert sp.fuel_direct, "the gauge shows a measurement, not a tank level"
+    assert not sp.handbrake, "the handbrake must never be engaged in this mode"
     assert sp.kl15 and sp.engine, "the cluster must see a running engine"
 
     # Full scale on every dial, and a link faster than the rated speed must
@@ -699,6 +706,15 @@ def selftest() -> None:
     second = metrics.sample()
     assert second is not None
     assert second.download_bytes_per_s == 0.0
+
+    # Whatever the inputs, the handbrake stays released: engaging it above
+    # about 20 km/h latches the cluster's brake warning.
+    for speed_fraction in (0.0, 0.25, 1.0):
+        probe = Mapper(opt).to_setpoints(
+            Reading(download_bytes_per_s=full_scale * speed_fraction,
+                    battery_present=True, battery_charge=0.5, cpu_celsius=40.0),
+            now=0.0)
+        assert not probe.handbrake, speed_fraction
 
     # Opting back in must still drive the gauge, since the firmware support
     # and the wire field both remain.

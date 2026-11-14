@@ -49,7 +49,21 @@ public:
     uint8_t clockMinute() const;
     uint8_t clockSecond() const;
 
+    /// Distinct identifiers the cluster has transmitted, with a count each.
+    /// Recorded so that what the cluster says about itself can be inspected,
+    /// rather than inferred from what it displays.
+    static constexpr uint8_t TrackedIdentifiers = 12;
+    uint8_t distinctCount() const;
+    uint16_t identifierAt(uint8_t index) const;
+    uint16_t countAt(uint8_t index) const;
+
 private:
+    /// Records one identifier in the table, if there is room.
+    void track(uint16_t identifier);
+
+    uint16_t seenId_[TrackedIdentifiers] = {};
+    uint16_t seenCount_[TrackedIdentifiers] = {};
+    uint8_t seenUsed_ = 0;
     bool temperatureSeen_ = false;
     uint8_t temperatureRaw_ = cfg::feedback::TemperatureUnavailable;
     int16_t temperatureDeciC_ = 0;

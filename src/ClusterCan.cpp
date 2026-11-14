@@ -104,6 +104,15 @@ uint8_t ClusterCan::brakeStatus() const {
     return stabilityBrakeStatus_;
 }
 
+void ClusterCan::startSymbolSweep(uint16_t highestIdentifier) {
+    sweepNext_ = 1;
+    sweepLast_ = highestIdentifier;
+}
+
+bool ClusterCan::symbolSweepRunning() const {
+    return sweepNext_ != 0;
+}
+
 void ClusterCan::setOdometerMode(OdometerMode mode) {
     state_.setOdometerMode(mode);
     distanceRemainder_ = 0.0f;
@@ -147,6 +156,18 @@ void ClusterCan::update() {
 
         serviceSlot(static_cast<uint8_t>(tickCount_ % cfg::schedule::SlotsPerCycle));
         serviceAperiodic(now);
+
+        // One symbol clear per tick while a sweep is running, so the sweep
+        // costs one extra short frame per 10 ms rather than a burst.
+        if (sweepNext_ != 0) {
+            bus_.send(CheckControl::buildMessage(sweepNext_, false));
+            ++sweepNext_;
+            if (sweepNext_ > sweepLast_) {
+                sweepNext_ = 0;
+                Serial.println(F("symbol sweep finished"));
+            }
+        }
+
         drainReceiveQueue();
     }
 }
@@ -261,8 +282,10 @@ void ClusterCan::serviceAperiodic(uint32_t nowMs) {
         (tickCount_ % cfg::schedule::TicksPer5Seconds) == cfg::schedule::PhaseParkBrake;
     if (cfg::send::ParkBrake && (parkBrakeChanged || parkBrakeRepeatDue)) {
         lastParkBrakeSent_ = state_.handbrake();
-        sendParkBrake();
+        sendParkBrake(state_.handbrake());
     }
+
+    serviceBrakeLatch(nowMs);
 
     if (cfg::send::Range &&
         (tickCount_ % cfg::schedule::TicksPer1Second) == cfg::schedule::PhaseRange) {
@@ -287,6 +310,30 @@ void ClusterCan::serviceAperiodic(uint32_t nowMs) {
     if (cfg::send::Clock && clock_.isValid() && clockSlot && clockDue) {
         lastClockSendMs_ = nowMs;
         sendTimeAndDate();
+    }
+}
+
+void ClusterCan::serviceBrakeLatch(uint32_t nowMs) {
+    const bool moving = state_.roadSpeed() > cfg::limits::HandbrakeLatchSpeedKmh;
+    if (state_.handbrake() && moving) {
+        brakeLatchSuspected_ = true;
+    }
+
+    const bool stationary = state_.roadSpeed() == 0;
+    if (clearPulseStage_ == 0) {
+        // Only at a standstill, where an engage cannot sound the moving
+        // handbrake warning, and only once per latching event.
+        if (brakeLatchSuspected_ && !state_.handbrake() && stationary) {
+            sendParkBrake(true);
+            clearPulseStage_ = 1;
+            clearPulseMs_ = nowMs;
+        }
+    } else if ((nowMs - clearPulseMs_) >= cfg::limits::HandbrakeClearPulseMs) {
+        sendParkBrake(false);
+        clearPulseStage_ = 0;
+        brakeLatchSuspected_ = false;
+        lastParkBrakeSent_ = false;
+        Serial.println(F("brake warning cleared (handbrake latch pulse)"));
     }
 }
 
@@ -549,9 +596,9 @@ void ClusterCan::sendStabilityStatus() {
     bus_.send(message);
 }
 
-void ClusterCan::sendParkBrake() {
+void ClusterCan::sendParkBrake(bool engaged) {
     CanMessage message(cfg::canid::ParkBrakeStatus, frame::parkBrake::Length);
-    message[0] = state_.handbrake() ? frame::parkBrake::Engaged : frame::parkBrake::Released;
+    message[0] = engaged ? frame::parkBrake::Engaged : frame::parkBrake::Released;
     message[1] = frame::common::Filler;
     bus_.send(message);
 }

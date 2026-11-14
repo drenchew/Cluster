@@ -93,6 +93,15 @@ public:
 
     uint8_t brakeStatus() const;
 
+    /// Starts clearing every check control symbol from 1 up to the given
+    /// identifier, one per scheduler tick so the transmission schedule is not
+    /// disturbed. Used to establish whether a warning the cluster is holding
+    /// is a numbered symbol at all: if a full sweep does not extinguish it,
+    /// the cause is a signal or a sensor input rather than a symbol.
+    void startSymbolSweep(uint16_t highestIdentifier);
+
+    bool symbolSweepRunning() const;
+
     /// Selects how the distance accumulator advances and restarts it.
     void setOdometerMode(OdometerMode mode);
 
@@ -136,7 +145,7 @@ private:
     void sendBrake();
     void sendEngineTemperature();
     void sendStabilityStatus();
-    void sendParkBrake();
+    void sendParkBrake(bool engaged);
     void sendAbsCounter();
     void sendAirbagCounter();
     void sendFuelLevel();
@@ -171,12 +180,27 @@ private:
     uint8_t gearCounter_ = 0;
     uint8_t stabilityCounter_ = 0;
     uint8_t stabilityBrakeStatus_ = frame::stability::BrakeStatusDefault;
+    /// Zero when no sweep is in progress.
+    uint16_t sweepNext_ = 0;
+    uint16_t sweepLast_ = 0;
     uint8_t cruiseTimer_ = 0;
     uint8_t lastCruiseSpeed_ = frame::cruise::SpeedWhenOff;
 
     /// Last park brake state placed on the bus, so the frame can be sent on
     /// change as a vehicle does rather than continuously.
     bool lastParkBrakeSent_ = false;
+
+    /// Set when the handbrake was engaged above the latching speed, which
+    /// leaves the cluster's brake warning lit after the release. Cleared by
+    /// the pulse that reproduces, automatically, the engage-and-release at
+    /// standstill that the cluster needs in order to extinguish it.
+    bool brakeLatchSuspected_ = false;
+    /// 0 idle, 1 engage sent, 2 release due.
+    uint8_t clearPulseStage_ = 0;
+    uint32_t clearPulseMs_ = 0;
+
+    /// Emits the clearing pulse when it is both needed and safe.
+    void serviceBrakeLatch(uint32_t nowMs);
 
     /// Cumulative injected fuel reported in 0x1D0, with the fractional part
     /// carried between frames so that a low demand still accumulates.
