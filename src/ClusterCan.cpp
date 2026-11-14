@@ -101,6 +101,12 @@ void ClusterCan::setOdometerMode(OdometerMode mode) {
     distanceRemainder_ = 0.0f;
 }
 
+void ClusterCan::clearLatchedWarnings() {
+    for (uint8_t i = 0; i < cfg::symbol::LatchedAtBootCount; ++i) {
+        bus_.send(CheckControl::buildMessage(cfg::symbol::LatchedAtBoot[i], false));
+    }
+}
+
 void ClusterCan::clearDriverRequests() {
     setTractionLamps(false, false, false);
     setWarnings(0);

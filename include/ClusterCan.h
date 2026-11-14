@@ -91,6 +91,11 @@ public:
     /// Clears every telltale this class raises. Used when the host is lost.
     void clearDriverRequests();
 
+    /// Clears the symbols listed in cfg::symbol::LatchedAtBoot. Those are not
+    /// managed by the periodic refresh, so a cluster holding one would keep
+    /// displaying it for as long as it is powered.
+    void clearLatchedWarnings();
+
     uint16_t odometerCounter() const;
     ICanBus::Statistics statistics() const;
 

@@ -27,6 +27,11 @@ void Application::begin() {
         cluster_.setSymbol(cfg::symbol::Service, false);
     }
 
+    // A cluster can also be holding warnings from its time in a vehicle or
+    // from an earlier bench session. Nothing else on this bus would clear
+    // them, so they are cleared once here.
+    cluster_.clearLatchedWarnings();
+
     console_.printBanner();
 }
 

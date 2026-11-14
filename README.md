@@ -406,13 +406,13 @@ python3 run_sysmon.py --no-serial -v  # print the readings, touch no hardware
 python3 run_sysmon.py --selftest      # mapping checks
 ```
 
-This cluster has four needles, and the mode drives all four:
+This cluster has four needles. The mode drives three of them; the consumption
+needle is left alone for the reason given below.
 
 | needle | quantity | full scale |
 |---|---|---|
 | speedometer | network download rate | `--max-mbit`, default 100 Mbit/s, maps to 260 km/h |
 | tachometer | memory in use | 5500 rpm, the diesel redline |
-| consumption | processor load | 0 to 100 percent demand |
 | fuel level | battery charge | a full tank is a full battery |
 
 The clock shows the host's time. Processor temperature is sent as the coolant
@@ -427,6 +427,9 @@ If the fourth needle on a particular cluster turns out to be oil temperature
 rather than consumption — the reference notes both variants exist — then
 0x1D0 byte 1 is the one to drive, and it currently carries coolant minus
 twenty degrees.
+
+Processor load has no needle of its own as a result, and reaches the driver
+through the check engine telltale.
 
 Telltales light on sustained load: check engine above 90 percent processor,
 tyre pressure above 90 percent memory, the coolant warning above 85 °C, and
@@ -491,15 +494,35 @@ by comparing against the reference driver rather than by reasoning:
   `0xCC` and `0xFF`. The temperatures worked with the old values; the
   consumption reading did not.
 
-One limitation is inherent to the gauge. It reads economy, distance divided by
-fuel, so it depends on road speed as well as the injection rate — and in this
-mode road speed is the download rate. The needle therefore shows a ratio of
-the two rather than processor load alone, and it reads at the top of its scale
-when nothing is downloading. Decoupling them is possible, because the
-speedometer is driven by 0x1A0 while consumption uses the separate 0x1A6
-distance accumulator, which can be advanced at a fixed synthetic rate; the
-cost is that the odometer then accrues mileage independently of the displayed
-speed.
+**The gauge is nonetheless not driven, and the reason is inherent to it.** It
+reads economy — distance divided by fuel — so it depends on road speed as well
+as the injection rate, and in this mode road speed is the download rate. The
+needle shows a ratio of the two rather than processor load, and pins at the
+top of its scale when nothing is downloading. Decoupling them is possible,
+since the speedometer runs off 0x1A0 while consumption uses the separate 0x1A6
+distance accumulator, which could be advanced at a fixed synthetic rate; the
+cost is an odometer accruing mileage unrelated to the displayed speed. The
+firmware support and the wire field both remain, so setting
+`max_consumption_percent` above zero drives the gauge again for anyone who
+wants that ratio.
+
+0x12F is disabled by default for the same reason — nothing needs it while the
+gauge is undriven. Transmitting it coincided with the first transmission
+failures recorded on this jig, but measurement cleared it: the rate was one
+failure per 780 frames both with it and without, so roughly 0.13 percent of
+frames lose arbitration against the cluster's own traffic, which a shared bus
+does normally.
+
+### Clearing warnings the cluster latched
+
+The periodic symbol refresh only covers the telltales this firmware manages.
+A cluster can be holding others from its time in a vehicle or from an earlier
+bench session, and nothing else on the bus would clear them, so they stay
+displayed for as long as it is powered — a red brake warning left over from a
+handbrake test is the case that prompted this. `cfg::symbol::LatchedAtBoot`
+lists those, and they are cleared once at startup. Add to that list if a
+warning ever appears that will not go out; `y <id> 0` clears one by hand
+first, to confirm the identifier.
 
 **Needles need smoothing, gauges need none.** A download rate measured over a
 tenth of a second varies far more than the quantity being displayed, so the

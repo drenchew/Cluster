@@ -4,11 +4,14 @@ The cluster becomes a system monitor:
 
     speedometer        network download rate
     tachometer         memory in use
-    consumption gauge  processor load
     fuel gauge         battery charge
 
 This cluster carries four needles: road speed, engine speed, fuel level and
-instant consumption. There is no coolant temperature needle on this variant;
+instant consumption. The consumption needle is not driven: it reads economy,
+distance divided by fuel, so it depends on road speed as well as fuel rate,
+and road speed here is the download rate. It therefore cannot show processor
+load on its own. Processor load reaches the driver through the check engine
+telltale instead. There is no coolant temperature needle on this variant;
 the value is still transmitted, because the cluster expects a plausible engine
 temperature, and it drives the overheat telltale and the hidden service menu
 rather than a dial.
@@ -382,10 +385,12 @@ class MapOptions:
     # The diesel tachometer reads to 5500 rpm.
     max_rpm: int = 5500
 
-    # Processor load goes to the consumption gauge, which has no warning at
-    # either end of its range. The firmware converts this demand figure into
-    # the cumulative injected-fuel count the cluster differentiates.
-    max_consumption_percent: int = 100
+    # Fuel demand sent to the consumption gauge. Left at zero: that gauge
+    # reads economy, so it divides by road speed, which this mode uses for the
+    # download rate, and the needle shows a ratio of the two rather than
+    # processor load. The firmware support remains, so raising this drives the
+    # gauge again for anyone who wants that ratio.
+    max_consumption_percent: int = 0
 
     # The fuel gauge shows the battery charge, which is the natural fit: both
     # are a reserve being consumed, and the cluster's own low fuel warning
@@ -497,7 +502,7 @@ class Mapper:
         sp = lk.Setpoints()
         sp.speed_kmh = int(round(download * opt.max_speed_kmh))
         sp.rpm = int(round(memory * opt.max_rpm))
-        # Processor load drives the consumption gauge.
+        # Zero by default; see max_consumption_percent.
         sp.consumption_pct = int(round(cpu * opt.max_consumption_percent))
 
         # Battery charge drives the fuel gauge, falling back to free
@@ -562,7 +567,7 @@ def describe(reading: Reading, sp: lk.Setpoints, opt: MapOptions) -> str:
         reserve = f"disk {reading.disk_free * 100:3.0f}%"
     return (f"down {down_mbit:7.2f} Mbit/s -> {sp.speed_kmh:3d} km/h   "
             f"ram {reading.memory_used * 100:5.1f}% -> {sp.rpm:4d} rpm   "
-            f"cpu {reading.cpu_load * 100:5.1f}% -> {sp.consumption_pct:3d}%   "
+            f"cpu {reading.cpu_load * 100:5.1f}%   "
             f"{reserve} -> {sp.fuel_l:4.1f} l   "
             f"temp {temperature} -> {sp.coolant_c:3d}C   "
             f"up {up_mbit:5.2f} Mbit/s   warn 0x{sp.warn:02X}")
@@ -594,7 +599,7 @@ def selftest() -> None:
     sp = mapper.to_setpoints(half, now=0.0)
     assert sp.speed_kmh == 130, sp.speed_kmh
     assert sp.rpm == 2750, sp.rpm
-    assert sp.consumption_pct == 25, sp.consumption_pct
+    assert sp.consumption_pct == 0, "the consumption gauge is not driven"
     # Battery takes the fuel gauge, so half a charge is half a tank. The
     # filesystem figure is deliberately different, to catch a mix-up.
     assert abs(sp.fuel_l - 30.0) < 0.01, sp.fuel_l
@@ -613,7 +618,7 @@ def selftest() -> None:
     sp = mapper.to_setpoints(loaded, now=0.0)
     assert sp.speed_kmh == opt.max_speed_kmh, sp.speed_kmh
     assert sp.rpm == opt.max_rpm, sp.rpm
-    assert sp.consumption_pct == opt.max_consumption_percent, sp.consumption_pct
+    assert sp.consumption_pct == 0, sp.consumption_pct
     assert abs(sp.fuel_l - opt.tank_litres) < 0.01, sp.fuel_l
     assert sp.warn & lk.WARN_CHECK_ENGINE
     assert sp.warn & lk.WARN_TYRE, "memory pressure uses the tyre symbol"
@@ -694,6 +699,14 @@ def selftest() -> None:
     second = metrics.sample()
     assert second is not None
     assert second.download_bytes_per_s == 0.0
+
+    # Opting back in must still drive the gauge, since the firmware support
+    # and the wire field both remain.
+    opted_in = Mapper(MapOptions(max_download_mbit=100.0, smoothing_seconds=0.0,
+                                 max_consumption_percent=100))
+    assert opted_in.to_setpoints(
+        Reading(cpu_load=0.4, battery_present=True, battery_charge=0.5,
+                cpu_celsius=40.0), now=0.0).consumption_pct == 40
 
     assert "down" in describe(half, sp, opt)
     print("sysmon selftest OK  (mapping, full scale, idle, smoothing, "

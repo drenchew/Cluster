@@ -79,7 +79,12 @@ constexpr uint16_t ClusterClock = 0x2F8;
 /// Enables for each group of transmitted frames.
 namespace send {
 constexpr bool WarningSuppression = true;  ///< [verified] 0x19E, 0x0C0, 0x0D7
-constexpr bool DmeStatus = true;           ///< [verified] 0x12F engine controller status
+/// 0x12F engine controller status. Required only by the instant consumption
+/// reading, which is not driven: that gauge divides by road speed and so
+/// cannot show an independent quantity. Disabled because transmitting it
+/// coincided with the first transmission failures this jig has recorded,
+/// suggesting another node already owns the identifier.
+constexpr bool DmeStatus = false;
 constexpr bool Fuel = true;                ///< [verified] 0x349
 constexpr bool Coolant = true;             ///< [verified] 0x1D0
 constexpr bool Lights = true;              ///< [verified] 0x21A
@@ -290,6 +295,24 @@ constexpr uint16_t OnRefreshMs = 200;
 constexpr uint16_t OffRefreshMs = 3000;
 /// A cluster removed from a vehicle usually powers up with a service message.
 constexpr bool SuppressServiceAtBoot = true;
+
+/// Symbols a cluster can be holding from its life in a vehicle, or from an
+/// earlier bench session, and which nothing on this bus would otherwise
+/// clear. They are cleared once at startup. The periodic refresh only covers
+/// the symbols this firmware manages, so a latched warning outside that set
+/// stays displayed indefinitely; a red brake warning left showing after a
+/// handbrake test is the case that prompted this.
+constexpr uint16_t LatchedAtBoot[] = {
+    BrakeFault,     // 308 red brake
+    353,            // brakes hot
+    41,             // red triangle
+    37,             // yellow triangle
+    302,            // vehicle can roll away
+    244,            // foot on brake
+    40,             // start, foot on brake
+};
+constexpr uint8_t LatchedAtBootCount =
+    static_cast<uint8_t>(sizeof(LatchedAtBoot) / sizeof(LatchedAtBoot[0]));
 }  // namespace symbol
 
 /// Warning lamp bits in the mask exchanged with the host.
