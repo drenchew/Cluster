@@ -279,7 +279,7 @@ void ClusterCan::serviceAperiodic(uint32_t nowMs) {
     // state changes, with an occasional repeat while it holds.
     const bool parkBrakeChanged = (state_.handbrake() != lastParkBrakeSent_);
     const bool parkBrakeRepeatDue =
-        (tickCount_ % cfg::schedule::TicksPer5Seconds) == cfg::schedule::PhaseParkBrake;
+        (tickCount_ % cfg::schedule::TicksPer100Ms) == cfg::schedule::PhaseParkBrake;
     if (cfg::send::ParkBrake && (parkBrakeChanged || parkBrakeRepeatDue)) {
         lastParkBrakeSent_ = state_.handbrake();
         sendParkBrake(state_.handbrake());

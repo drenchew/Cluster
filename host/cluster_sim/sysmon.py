@@ -2,7 +2,7 @@
 
 The cluster becomes a system monitor:
 
-    speedometer        network download rate
+    speedometer        network download rate, 26 MB/s at full scale
     tachometer         memory in use
     fuel gauge         battery charge
 
@@ -54,6 +54,7 @@ SYS_THERMAL = "/sys/class/thermal"
 LOOPBACK = "lo"
 BITS_PER_BYTE = 8
 BITS_PER_MEGABIT = 1_000_000
+BYTES_PER_MEGABYTE = 1_000_000
 KIB = 1024
 MILLIDEGREES_PER_DEGREE = 1000.0
 
@@ -377,9 +378,13 @@ class MapOptions:
     """Full-scale values for each dial, and the warning thresholds."""
 
     # The speedometer face reads to 260 km/h, so that is full scale. The rate
-    # it corresponds to has to be chosen: a gigabit link would otherwise keep
-    # the needle against its stop on a 100 Mbit/s connection, and vice versa.
-    max_download_mbit: float = 100.0
+    # it corresponds to has to be chosen to suit the connection: too low and
+    # the needle sits against its stop, too high and the upper part of the
+    # dial is never used.
+    #
+    # 208 Mbit/s is 26 MB/s, chosen to just exceed a 200 Mbit/s line so that
+    # saturating it reads near, but not beyond, full scale.
+    max_download_mbit: float = 208.0
     max_speed_kmh: int = 260
 
     # The diesel tachometer reads to 5500 rpm.
@@ -412,12 +417,23 @@ class MapOptions:
     # not a fault.
     warn_battery_charge: float = 0.15
 
-    # Processor temperature is reported as the coolant temperature unchanged,
-    # since both are temperatures in degrees Celsius. This variant of the
-    # cluster has no coolant needle, so the value reaches the driver through
-    # the overheat telltale and the hidden service menu; it is still worth
-    # sending, because the cluster expects a plausible engine temperature.
-    # A machine with no readable sensor reports this instead.
+    # Processor temperature is reported as the coolant temperature only once
+    # it is genuinely high. This cluster variant has no coolant needle, so the
+    # only place the value appears is the overheat telltale, and a processor
+    # that idles in the eighties kept that lit and chiming. Below the
+    # threshold a fixed, plausible engine temperature goes out instead, which
+    # is what the cluster expects and which warns about nothing; at or above
+    # it the real figure is sent and the telltale lights, so a genuine thermal
+    # problem is still reported.
+    report_above_celsius: float = 98.0
+    coolant_celsius: int = 90
+
+    # Once reporting, it continues until the temperature falls this far below
+    # the threshold, so a processor sitting exactly on it cannot make the
+    # telltale flicker.
+    report_hysteresis_celsius: float = 3.0
+
+    # Used when reporting is active but no sensor could be read.
     fallback_celsius: int = 60
 
     # Telltales. Each is a fraction of full scale except the temperature.
@@ -480,6 +496,7 @@ class Mapper:
         self._cpu = _Smoother(self.options.smoothing_seconds)
         # Temperature already changes slowly, so it is passed through.
         self._temperature = _Smoother(0.0)
+        self._reporting_temperature = False
 
     def to_setpoints(self, reading: Reading, now: float | None = None) -> lk.Setpoints:
         opt = self.options
@@ -494,10 +511,21 @@ class Mapper:
         memory = self._memory.update(_clamp_unit(reading.memory_used), moment)
         cpu = self._cpu.update(_clamp_unit(reading.cpu_load), moment)
 
-        celsius = reading.cpu_celsius
-        if celsius is None:
-            celsius = float(opt.fallback_celsius)
-        celsius = self._temperature.update(celsius, moment)
+        measured = reading.cpu_celsius
+        if measured is None:
+            measured = float(opt.fallback_celsius)
+
+        # Latching comparison: rising past the threshold starts reporting,
+        # and it stops only after falling back through the hysteresis band.
+        if measured >= opt.report_above_celsius:
+            self._reporting_temperature = True
+        elif measured < (opt.report_above_celsius - opt.report_hysteresis_celsius):
+            self._reporting_temperature = False
+
+        if self._reporting_temperature:
+            celsius = self._temperature.update(measured, moment)
+        else:
+            celsius = float(opt.coolant_celsius)
 
         sp = lk.Setpoints()
         sp.speed_kmh = int(round(download * opt.max_speed_kmh))
@@ -545,7 +573,10 @@ class Mapper:
             warn |= lk.WARN_CHECK_ENGINE
         if memory >= opt.warn_memory_used:
             warn |= lk.WARN_TYRE
-        if celsius >= opt.warn_cpu_celsius:
+        # Only while the real temperature is being reported. Below the
+        # threshold the transmitted value is a fixed constant and must never
+        # raise anything.
+        if self._reporting_temperature:
             warn |= lk.WARN_COOLANT
         if (reading.battery_present and not reading.battery_charging
                 and reading.battery_charge <= opt.warn_battery_charge):
@@ -561,22 +592,27 @@ def _clamp_unit(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def megabytes_to_megabits(megabytes_per_s: float) -> float:
+    """Converts a rate in MB/s to the Mbit/s the options are expressed in."""
+    return megabytes_per_s * BITS_PER_BYTE
+
+
 def describe(reading: Reading, sp: lk.Setpoints, opt: MapOptions) -> str:
     """One line summarising a reading and what it put on the dials."""
-    down_mbit = reading.download_bytes_per_s * BITS_PER_BYTE / BITS_PER_MEGABIT
-    up_mbit = reading.upload_bytes_per_s * BITS_PER_BYTE / BITS_PER_MEGABIT
+    down_mbyte = reading.download_bytes_per_s / BYTES_PER_MEGABYTE
+    up_mbyte = reading.upload_bytes_per_s / BYTES_PER_MEGABYTE
     temperature = ("%.0fC" % reading.cpu_celsius) if reading.cpu_celsius is not None else "--"
     if reading.battery_present:
         reserve = (f"batt {reading.battery_charge * 100:3.0f}%"
                    f"{'+' if reading.battery_charging else '-'}")
     else:
         reserve = f"disk {reading.disk_free * 100:3.0f}%"
-    return (f"down {down_mbit:7.2f} Mbit/s -> {sp.speed_kmh:3d} km/h   "
+    return (f"down {down_mbyte:6.2f} MB/s -> {sp.speed_kmh:3d} km/h   "
             f"ram {reading.memory_used * 100:5.1f}% -> {sp.rpm:4d} rpm   "
             f"cpu {reading.cpu_load * 100:5.1f}%   "
             f"{reserve} -> {sp.fuel_l:4.1f} l   "
             f"temp {temperature} -> {sp.coolant_c:3d}C   "
-            f"up {up_mbit:5.2f} Mbit/s   warn 0x{sp.warn:02X}")
+            f"up {up_mbyte:5.2f} MB/s   warn 0x{sp.warn:02X}")
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +645,10 @@ def selftest() -> None:
     # Battery takes the fuel gauge, so half a charge is half a tank. The
     # filesystem figure is deliberately different, to catch a mix-up.
     assert abs(sp.fuel_l - 30.0) < 0.01, sp.fuel_l
-    assert sp.coolant_c == 55, sp.coolant_c
+    # The processor temperature is not transmitted by default; a fixed,
+    # plausible engine temperature goes out instead.
+    assert sp.coolant_c == opt.coolant_celsius, sp.coolant_c
+    assert not (sp.warn & lk.WARN_COOLANT), "a constant value must never warn"
     assert sp.warn == 0, hex(sp.warn)
     assert sp.fuel_direct, "the gauge shows a measurement, not a tank level"
     assert not sp.handbrake, "the handbrake must never be engaged in this mode"
@@ -629,7 +668,6 @@ def selftest() -> None:
     assert abs(sp.fuel_l - opt.tank_litres) < 0.01, sp.fuel_l
     assert sp.warn & lk.WARN_CHECK_ENGINE
     assert sp.warn & lk.WARN_TYRE, "memory pressure uses the tyre symbol"
-    assert sp.warn & lk.WARN_COOLANT
     assert not (sp.warn & lk.WARN_FUEL), \
         "the reserve symbol belongs to the cluster, not to this mapping"
 
@@ -681,10 +719,33 @@ def selftest() -> None:
     assert abs(desktop.fuel_l - 30.0) < 0.01, desktop.fuel_l
     assert not (desktop.warn & lk.WARN_BATTERY), "no battery is not a flat battery"
 
-    # A machine with no temperature sensor must not read as frozen.
+    # A hot processor is reported, with its telltale; an ordinary one is not.
     mapper = Mapper(opt)
-    sp = mapper.to_setpoints(Reading(cpu_celsius=None), now=0.0)
-    assert sp.coolant_c == opt.fallback_celsius, sp.coolant_c
+    cool = mapper.to_setpoints(Reading(cpu_celsius=85.0), now=0.0)
+    assert cool.coolant_c == opt.coolant_celsius, cool.coolant_c
+    assert not (cool.warn & lk.WARN_COOLANT), "an idle processor must not warn"
+
+    mapper = Mapper(opt)
+    hot = mapper.to_setpoints(Reading(cpu_celsius=101.0), now=0.0)
+    assert hot.coolant_c == 101, hot.coolant_c
+    assert hot.warn & lk.WARN_COOLANT, "a hot processor must warn"
+
+    # Hysteresis: having started, reporting continues through the band and
+    # stops below it, so a processor sitting on the threshold cannot make the
+    # telltale flicker.
+    mapper = Mapper(opt)
+    mapper.to_setpoints(Reading(cpu_celsius=99.0), now=0.0)
+    inside = mapper.to_setpoints(Reading(cpu_celsius=96.0), now=0.1)
+    assert inside.warn & lk.WARN_COOLANT, "should still be reporting at 96"
+    outside = mapper.to_setpoints(Reading(cpu_celsius=94.0), now=0.2)
+    assert not (outside.warn & lk.WARN_COOLANT), "should have stopped at 94"
+    assert outside.coolant_c == opt.coolant_celsius, outside.coolant_c
+
+    # No sensor at all must not read as a thermal fault.
+    mapper = Mapper(opt)
+    blind = mapper.to_setpoints(Reading(cpu_celsius=None), now=0.0)
+    assert blind.coolant_c == opt.coolant_celsius, blind.coolant_c
+    assert not (blind.warn & lk.WARN_COOLANT)
 
     # Every frame must still fit the wire format the firmware expects.
     assert len(sp.pack()) == lk.PAYLOAD_LEN + 4

@@ -8,15 +8,19 @@
 
 The dials read:
 
-    speedometer        network download rate  (full scale --max-mbit)
+    speedometer        network download rate  (full scale --max-mbyte, 26 MB/s)
     tachometer         memory in use          (full scale 5500 rpm)
     consumption gauge  processor load         (0 to 100 percent demand)
     fuel gauge         battery charge         (a full tank is a full battery)
     on-board clock     this machine's clock
 
-Those are the four needles this cluster has. Processor temperature is also
-sent, as the coolant temperature, but this variant has no needle for it: it
-appears as the overheat telltale and in the hidden service menu.
+Those are the four needles this cluster has. Processor temperature is sent as
+the coolant temperature only once it reaches --temp-above degrees, 98 by
+default: this variant has no coolant needle, so the only place it appears is
+the overheat telltale, and a processor that idles in the eighties kept that
+lit and chiming. Below the threshold a fixed, plausible engine temperature
+goes out instead, so a genuine thermal problem still warns and ordinary
+running does not.
 
 Telltales light for sustained processor load, memory nearly exhausted and a
 hot processor.
@@ -71,8 +75,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iface", action="append",
                         help="network interface to count; repeat for several "
                              "(default: every interface that is up)")
-    parser.add_argument("--max-mbit", type=float, default=100.0,
-                        help="download rate that reads as full scale (default 100)")
+    parser.add_argument("--max-mbyte", type=float, default=26.0,
+                        help="download rate in MB/s that reads as full scale "
+                             "(default 26, which is 208 Mbit/s and just over a "
+                             "200 Mbit/s line)")
+    parser.add_argument("--max-mbit", type=float,
+                        help="the same limit expressed in Mbit/s; overrides "
+                             "--max-mbyte if both are given")
     parser.add_argument("--max-speed", type=int, default=260,
                         help="speedometer full scale in km/h (default 260)")
     parser.add_argument("--max-rpm", type=int, default=5500,
@@ -88,6 +97,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="filesystem shown on the fuel gauge (default /)")
     parser.add_argument("--smoothing", type=float, default=0.45,
                         help="needle smoothing half-life in seconds (default 0.45)")
+    parser.add_argument("--temp-above", type=float, default=98.0,
+                        help="report the processor temperature as the coolant "
+                             "temperature once it reaches this many degrees, "
+                             "which also lights the overheat telltale. Below "
+                             "it a fixed, plausible figure is sent instead "
+                             "(default 98)")
     parser.add_argument("--no-clock", action="store_true",
                         help="leave the cluster clock alone")
     parser.add_argument("--rate", type=float, default=SEND_HZ,
@@ -119,13 +134,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     metrics = sysmon.SystemMetrics(interfaces=args.iface, disk_path=args.disk)
+    full_scale_mbit = (args.max_mbit if args.max_mbit is not None
+                       else sysmon.megabytes_to_megabits(args.max_mbyte))
     mapper = sysmon.Mapper(sysmon.MapOptions(
-        max_download_mbit=args.max_mbit,
+        max_download_mbit=full_scale_mbit,
         max_speed_kmh=args.max_speed,
         max_rpm=args.max_rpm,
         tank_litres=args.tank_l,
         fuel_floor_litres=args.fuel_floor_l,
         smoothing_seconds=args.smoothing,
+        report_above_celsius=args.temp_above,
         show_clock=not args.no_clock,
     ))
 
@@ -136,7 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"interfaces : {', '.join(metrics.interfaces) or 'none found'}")
     print(f"temperature: {metrics.temperature_path or 'no sensor found'}")
     print(f"battery    : {metrics.battery_path or 'none, using filesystem instead'}")
-    print(f"full scale : {args.max_mbit:.0f} Mbit/s -> {args.max_speed} km/h, "
+    print(f"full scale : {full_scale_mbit / 8:.0f} MB/s "
+          f"({full_scale_mbit:.0f} Mbit/s) -> {args.max_speed} km/h, "
           f"memory -> {args.max_rpm} rpm, load -> consumption gauge, "
           f"charge -> {args.fuel_floor_l:.0f}..{args.tank_l:.0f} l")
     print(f"serial     : {port_text}")

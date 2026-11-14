@@ -194,7 +194,12 @@ private:
     /// leaves the cluster's brake warning lit after the release. Cleared by
     /// the pulse that reproduces, automatically, the engage-and-release at
     /// standstill that the cluster needs in order to extinguish it.
-    bool brakeLatchSuspected_ = false;
+    /// True at startup so the clearing pulse is emitted once on every power
+    /// up and after every reprogramming. The latch lives in the cluster, not
+    /// here, and survives a restart of this board: without this, a warning
+    /// latched during an earlier session would stay lit with nothing left
+    /// that knows to clear it.
+    bool brakeLatchSuspected_ = true;
     /// 0 idle, 1 engage sent, 2 release due.
     uint8_t clearPulseStage_ = 0;
     uint32_t clearPulseMs_ = 0;

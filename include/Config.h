@@ -156,7 +156,12 @@ constexpr uint8_t PhaseCruise = 11;        ///< within the 200 ms cycle
 constexpr uint8_t PhaseSymbols = 5;        ///< within each 100 ms group
 constexpr uint8_t PhaseClock = 3;          ///< within each 100 ms group
 constexpr uint8_t PhaseRange = 6;          ///< within each 1 s group
-constexpr uint8_t PhaseParkBrake = 6;      ///< within each 5 s group
+/// Within each 100 ms group. The park brake frame is event driven in a
+/// vehicle, with only an occasional keepalive, because 0x1B4 carries the same
+/// state continuously. This firmware cannot send 0x1B4 — the cluster owns
+/// that identifier — so 0x34F has to carry it alone, and a five second
+/// keepalive left the cluster without a current answer between frames.
+constexpr uint8_t PhaseParkBrake = 9;
 }  // namespace schedule
 
 /// Engine and vehicle limits applied when setpoints are accepted.
